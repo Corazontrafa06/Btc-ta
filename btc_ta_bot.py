@@ -111,6 +111,14 @@ OI_UP_PCT = 1.5
 SCAN_MINUTES = int(os.getenv("SCAN_MINUTES", "12"))
 MONITOR_MINUTES = int(os.getenv("MONITOR_MINUTES", "3"))
 REENTRY_HOURS = 6
+# Hasil backtest (backtest.py, Agu 2025–Nov 2026): tiga filter ini memperbaiki expectancy in-sample DAN out-of-sample.
+RSI_LONG_MAX_H4 = float(os.getenv("RSI_LONG_MAX_H4", "65"))    # jangan LONG kalau RSI H4 sudah >= ini (kejar pucuk)
+RSI_SHORT_MIN_H4 = float(os.getenv("RSI_SHORT_MIN_H4", "35"))  # jangan SHORT kalau RSI H4 sudah <= ini (kejar dasar)
+BLOCK_AGAINST_WEEKLY = os.getenv("BLOCK_AGAINST_WEEKLY", "1") == "1"  # tidak entry melawan bias Weekly
+TP2_MAX_R = float(os.getenv("TP2_MAX_R", "4"))                 # TP2 maksimal 4R dari tengah zona (0 = tanpa batas)
+EMA_STACK_SL_ATR = float(os.getenv("EMA_STACK_SL_ATR", "1.0"))  # rencana di alert EMA stack (yang diuji di backtest)
+EMA_STACK_TP_R = float(os.getenv("EMA_STACK_TP_R", "2.0"))
+EMA_STACK_VALID_HOURS = int(os.getenv("EMA_STACK_VALID_HOURS", "48"))
 FORMING_MAX_ATR = 1.2          # hanya FORMING kalau zona ≤ 1.2 ATR
 TRIGGER_MAX_ATR = 0.35         # harga harus sangat dekat / sudah di zona saat trigger
 
@@ -1086,6 +1094,10 @@ def make_idea(
     tp1, tp2, tp_note = _place_targets(side, mid, risk, min_rr, levels, wall)
     if tp1 is None or tp2 is None:
         return None, tp_note or "target tidak valid"
+    if TP2_MAX_R > 0:
+        cap = mid + TP2_MAX_R * risk if side == "LONG" else mid - TP2_MAX_R * risk
+        if (side == "LONG" and tp2 > cap) or (side == "SHORT" and tp2 < cap):
+            tp2 = max(cap, tp1) if side == "LONG" else min(cap, tp1)
     rr = abs(tp1 - mid) / risk
     if rr + 1e-9 < min_rr:
         return None, f"R:R 1:{rr:.1f} di bawah minimum 1:{min_rr:.1f}"
@@ -1229,6 +1241,23 @@ def _aggressive_blocks(
     return blocks
 
 
+def quality_blocks(side: str, analyses: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Filter dari analisis loss backtest: kejar RSI ekstrem dan melawan Weekly adalah cluster loss terbesar."""
+    blocks: List[str] = []
+    rsi_h4 = float(analyses.get("H4", {}).get("rsi", 50.0))
+    weekly = int(analyses.get("Weekly", {}).get("bias_score", 0))
+    if side == "LONG" and rsi_h4 >= RSI_LONG_MAX_H4:
+        blocks.append(f"RSI H4 {rsi_h4:.0f} ≥ {RSI_LONG_MAX_H4:.0f}, LONG terlambat")
+    if side == "SHORT" and rsi_h4 <= RSI_SHORT_MIN_H4:
+        blocks.append(f"RSI H4 {rsi_h4:.0f} ≤ {RSI_SHORT_MIN_H4:.0f}, SHORT terlambat")
+    if BLOCK_AGAINST_WEEKLY:
+        if side == "LONG" and weekly < 0:
+            blocks.append("Weekly bearish, LONG melawan tren besar")
+        if side == "SHORT" and weekly > 0:
+            blocks.append("Weekly bullish, SHORT melawan tren besar")
+    return blocks
+
+
 def build_decision(bundle: Dict[str, Any]) -> Dict[str, Any]:
     analyses: Dict[str, Dict[str, Any]] = bundle["analyses"]
     dfs: Dict[str, pd.DataFrame] = bundle["dfs"]
@@ -1261,10 +1290,11 @@ def build_decision(bundle: Dict[str, Any]) -> Dict[str, Any]:
         blocks.append("HTF tidak sepakat (butuh H4 searah dan Daily tidak melawan)")
 
     weekly = int(analyses.get("Weekly", {}).get("bias_score", 0))
-    if direction == "BULLISH" and weekly < 0:
-        passes.append("Weekly masih melawan — aggressive dimatikan kalau weekly strong")
-    elif direction == "BEARISH" and weekly > 0:
-        passes.append("Weekly masih melawan — aggressive dimatikan kalau weekly strong")
+    weekly_against = (direction == "BULLISH" and weekly < 0) or (direction == "BEARISH" and weekly > 0)
+    if weekly_against:
+        if not BLOCK_AGAINST_WEEKLY:
+            passes.append("Weekly masih melawan, aggressive dimatikan kalau Weekly strong")
+        # kalau BLOCK_AGAINST_WEEKLY aktif, alasannya muncul di blok filter kualitas
     elif direction != "NEUTRAL" and weekly == 0:
         passes.append("Weekly netral, tidak memblokir")
     elif direction != "NEUTRAL":
@@ -1406,6 +1436,18 @@ def build_decision(bundle: Dict[str, Any]) -> Dict[str, Any]:
                 agg_reason = "; ".join(agg_blocks)
             else:
                 agg_reason = "momentum H1 belum cukup kuat untuk aggressive"
+
+    # ========== FILTER KUALITAS (hasil backtest) ==========
+    if direction in ("BULLISH", "BEARISH"):
+        q_side = "LONG" if direction == "BULLISH" else "SHORT"
+        q_blocks = quality_blocks(q_side, analyses)
+        if q_blocks:
+            why = "; ".join(q_blocks)
+            blocks.extend(q_blocks)
+            if cons_idea:
+                cons_idea, cons_reason = None, why
+            if agg_idea:
+                agg_idea, agg_reason = None, why
 
     # ========== PHASE LOGIC (lebih ketat) ==========
     if cons_idea:
@@ -1629,7 +1671,7 @@ def _flow_line(flow: Dict[str, Any]) -> str:
 
 def _wall_line(book: Dict[str, Any], price: float) -> str:
     if not book.get("source"):
-        return "Dinding: buku order tidak tersedia"
+        return "Order book: tidak tersedia"
 
     def one(label: str, wall: Optional[Dict[str, float]], big: Optional[Dict[str, float]]) -> str:
         item = wall or big
@@ -1639,7 +1681,9 @@ def _wall_line(book: Dict[str, Any], price: float) -> str:
         pct = (item["price"] - price) / price * 100
         return f"{label} {tag} {fmt_usd(item['notional'])} @ {fmt_price(item['price'])} ({pct:+.1f}%)"
 
-    return f"{one('Ask', book.get('ask_wall'), book.get('ask_big'))} | {one('Bid', book.get('bid_wall'), book.get('bid_big'))} · {book['source']}"
+    if not any(book.get(k) for k in ("ask_wall", "ask_big", "bid_wall", "bid_big")):
+        return f"Order book: tidak ada dinding besar dekat harga · {book['source']}"
+    return f"Order book: {one('Ask', book.get('ask_wall'), book.get('ask_big'))} | {one('Bid', book.get('bid_wall'), book.get('bid_big'))} · {book['source']}"
 
 
 def format_report(bundle: Dict[str, Any], decision: Dict[str, Any], active: Optional[sqlite3.Row] = None) -> str:
@@ -1780,7 +1824,17 @@ def format_ema_stack_alert(stack: Dict[str, Any], price: float) -> str:
         "",
     ]
     lines.extend(format_ema_stack(stack)[2:])
-    lines += ["", "Ini bukan entry otomatis. Cek /ta untuk zona, SL, dan gerbang lain.", "<i>⚠️ Bukan saran finansial.</i>"]
+    atr_h4 = float(stack.get("atr_h4") or 0)
+    if atr_h4 > 0:
+        sl = price + EMA_STACK_SL_ATR * atr_h4
+        tp = price - EMA_STACK_TP_R * EMA_STACK_SL_ATR * atr_h4
+        lines += [
+            "",
+            f"Rencana yang diuji di backtest: SHORT ~${fmt_price(price)} · SL ${fmt_price(sl)} ({EMA_STACK_SL_ATR:g} ATR H4) · "
+            f"TP ${fmt_price(tp)} ({EMA_STACK_TP_R:g}R) · berlaku {EMA_STACK_VALID_HOURS} jam",
+            "Backtest Agu 2025–Nov 2026: edge tipis (≈ +0.1R/trade setelah fee), belum signifikan secara statistik.",
+        ]
+    lines += ["", "Bukan entry otomatis. Cek /ta untuk zona dan gerbang lain.", "<i>⚠️ Bukan saran finansial.</i>"]
     return "\n".join(lines)
 
 
@@ -1976,6 +2030,7 @@ async def collect_market(session: aiohttp.ClientSession) -> Dict[str, Any]:
     if h1_full is not None:
         stack_dfs["H1"] = h1_full
     stack = ema_stack(stack_dfs)
+    stack["atr_h4"] = float(analyses["H4"]["atr"])
     price = float(analyses["H1"]["last"])
     book, flow = await asyncio.gather(load_book(session, price), load_flow(session))
     return {"dfs": dfs, "analyses": analyses, "price": price, "book": book, "flow": flow, "ema_stack": stack}
@@ -2257,6 +2312,7 @@ Alert hanya keluar saat setup berkualitas.
 • TRIGGERED hanya kalau candle H1 + volume konfirmasi
 • FORMING hanya jika zona ≤ 1.2 ATR
 • Cooldown zona 6 jam
+• Tidak entry melawan Weekly, tidak kejar RSI H4 ekstrem (≥65 LONG / ≤35 SHORT), TP2 maks 4R
 • EMA stack SHORT (aturan kamu): kuning EMA7 di atas biru EMA25 &amp; pink EMA99 di H1+H3+H4 → alert sekali saat aktif
 
 <i>Bukan saran finansial.</i>
@@ -2676,6 +2732,28 @@ def _selftest_body() -> None:
         note="test",
     )
     assert wall_block is None and why_wall
+
+    # TP2 dibatasi TP2_MAX_R dari tengah zona
+    far_tp, _ = make_idea(
+        side="SHORT", style="conservative", entry_low=99.7, entry_high=100, sl=100.6,
+        atr_val=0.8, price=99.5, score=-8, resistances=[110], supports=[98.5, 80],
+        book={"ask_wall": None, "bid_wall": None}, note="test",
+    )
+    assert far_tp is not None
+    risk = far_tp["sl"] - far_tp["entry_mid"]
+    if TP2_MAX_R > 0:
+        assert (far_tp["entry_mid"] - far_tp["tp2"]) / risk <= TP2_MAX_R + 1e-6, far_tp
+        assert far_tp["tp2"] <= far_tp["tp1"]
+
+    # Filter kualitas
+    q = {"H4": {"rsi": 70}, "Weekly": {"bias_score": 1}}
+    assert any("RSI" in b for b in quality_blocks("LONG", q))
+    assert quality_blocks("SHORT", {"H4": {"rsi": 50}, "Weekly": {"bias_score": -1}}) == []
+    assert any("RSI" in b for b in quality_blocks("SHORT", {"H4": {"rsi": 30}, "Weekly": {"bias_score": -1}}))
+    if BLOCK_AGAINST_WEEKLY:
+        assert any("Weekly" in b for b in quality_blocks("LONG", {"H4": {"rsi": 50}, "Weekly": {"bias_score": -1}}))
+        assert any("Weekly" in b for b in quality_blocks("SHORT", {"H4": {"rsi": 50}, "Weekly": {"bias_score": 2}}))
+    assert quality_blocks("LONG", {"H4": {"rsi": 55}, "Weekly": {"bias_score": 0}}) == []
 
     fp1 = _fingerprint("LONG", 100000, 99000)
     fp2 = _fingerprint("LONG", 100050, 99040)

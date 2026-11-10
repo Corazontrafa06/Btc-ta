@@ -58,3 +58,9 @@ Tes: `python btc_ta_bot.py --selftest` (pakai DB sementara) · `python btc_ta_bo
 - Data diambil real-time dari Binance Futures public API (tanpa API key)
 - Bukan saran finansial. Selalu pakai risk management sendiri.
 - Bisa dikembangkan ke multi-pair nanti jika dibutuhkan.
+
+## Backtest
+
+Lihat `BACKTEST.md` (hasil, penyebab loss, dan alasan tiap filter). Ringkas: `python fetch_history.py`, lalu
+`python backtest.py decisions current` dan `python backtest.py report`.
+Filter baru bisa diatur lewat env: `RSI_LONG_MAX_H4`, `RSI_SHORT_MIN_H4`, `BLOCK_AGAINST_WEEKLY`, `TP2_MAX_R`.
