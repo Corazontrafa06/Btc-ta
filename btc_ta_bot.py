@@ -51,6 +51,9 @@ from telegram.constants import ParseMode
 from telegram.error import Forbidden
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+import market_tools as MT
+import strategies as STRAT
+
 # ====================== CONFIG ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "btc_ta.db")
@@ -119,6 +122,13 @@ TP2_MAX_R = float(os.getenv("TP2_MAX_R", "4"))                 # TP2 maksimal 4R
 EMA_STACK_SL_ATR = float(os.getenv("EMA_STACK_SL_ATR", "1.0"))  # rencana di alert EMA stack (yang diuji di backtest)
 EMA_STACK_TP_R = float(os.getenv("EMA_STACK_TP_R", "2.0"))
 EMA_STACK_VALID_HOURS = int(os.getenv("EMA_STACK_VALID_HOURS", "48"))
+# Panel strategi / alert tambahan
+BOT_LONG_ALERTS = os.getenv("BOT_LONG_ALERTS", "0") == "1"          # setup LONG bot: info saja (backtest negatif)
+STRAT_WATCH = [x.strip() for x in os.getenv("STRAT_WATCH", "trend:LONG").split(",") if x.strip()]  # alert "pantauan"
+STRAT_ALERTS = os.getenv("STRAT_ALERTS", "1") == "1"
+STRAT_COOLDOWN_HOURS = float(os.getenv("STRAT_COOLDOWN_HOURS", "6"))
+SNIPER_ALERT_COOLDOWN_HOURS = float(os.getenv("SNIPER_ALERT_COOLDOWN_HOURS", "12"))
+NEWS_CACHE_MINUTES = int(os.getenv("NEWS_CACHE_MINUTES", "10"))
 FORMING_MAX_ATR = 1.2          # hanya FORMING kalau zona ≤ 1.2 ATR
 TRIGGER_MAX_ATR = 0.35         # harga harus sangat dekat / sudah di zona saat trigger
 
@@ -1529,6 +1539,10 @@ def build_decision(bundle: Dict[str, Any]) -> Dict[str, Any]:
         if agg_reason and direction != "NEUTRAL":
             blocks.append(f"aggressive: {agg_reason}")
 
+    if selected is not None and selected["side"] == "LONG" and not BOT_LONG_ALERTS:
+        passes.append("setup LONG bot hanya info (backtest 1 tahun negatif), tidak di-alert")
+        selected = None
+
     return {
         "price": price,
         "score": score,
@@ -1782,11 +1796,10 @@ def format_report(bundle: Dict[str, Any], decision: Dict[str, Any], active: Opti
         lines.append("")
         lines.append("📍 Tidak ada alert. /ta tetap bisa dipanggil kapan saja.")
 
+    if bundle.get("raw"):
+        lines += [""] + format_quick_summary(bundle, decision, bundle.get("news"))
     lines += ["", "━━━━━━━━━━━━━━━━━━━━", "<i>⚠️ Bukan saran finansial. Selalu gunakan risk management.</i>"]
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3900] + "\n\n… (terpotong)"
-    return text
+    return "\n".join(lines)
 
 
 def format_ema_stack(stack: Optional[Dict[str, Any]]) -> List[str]:
@@ -1836,6 +1849,30 @@ def format_ema_stack_alert(stack: Dict[str, Any], price: float) -> str:
         ]
     lines += ["", "Bukan entry otomatis. Cek /ta untuk zona dan gerbang lain.", "<i>⚠️ Bukan saran finansial.</i>"]
     return "\n".join(lines)
+
+
+def format_strategy_alert(st: Dict[str, Any], mode: str, stat: Optional[Dict[str, Any]]) -> str:
+    s, p = st["strategy"], st["plan"]
+    head = "👁 <b>PANTAUAN</b>" if mode == "pantauan" else "🔔 <b>SINYAL STRATEGI</b>"
+    icon = "🟢" if s.side == "LONG" else "🔴"
+    lines = [
+        f"{head} · {icon} <b>{html_escape(s.name)} {s.side}</b>",
+        f"<i>{html_escape(s.desc)}</i>",
+        "",
+        f"Entry ~${fmt_price(p['entry'])} · SL ${fmt_price(p['sl'])} ({p['risk_pct']:.2f}%) · TP ${fmt_price(p['tp'])} (1:{p['rr']:.1f})",
+        f"Berlaku maks {p['hold_h']} jam.",
+    ]
+    if stat:
+        lines.append(f"Backtest 1 tahun: {stat['n']} trade, WR {stat['wr']:.0f}%, {stat['avg_r']:+.2f}R/trade, OOS {stat['oos_avg_r']:+.2f}R")
+    if mode == "pantauan":
+        lines.append("Pantauan saja: edge belum terbukti (OOS ≤ 0). Jangan dianggap entry.")
+    lines.append("<i>⚠️ Bukan saran finansial.</i>")
+    return "\n".join(lines)
+
+
+def html_escape(text: str) -> str:
+    import html as _html
+    return _html.escape(text, quote=False)
 
 
 def format_alert(state: str, plan: Dict[str, Any], extra: str = "") -> str:
@@ -2011,9 +2048,11 @@ async def collect_market(session: aiohttp.ClientSession) -> Dict[str, Any]:
     dfs: Dict[str, pd.DataFrame] = {}
     analyses: Dict[str, Dict[str, Any]] = {}
     h1_full: Optional[pd.DataFrame] = None
+    raw: Dict[str, pd.DataFrame] = {}
     for key, df in zip(TIMEFRAMES.keys(), frames):
         label = TIMEFRAMES[key]["label"]
         if df is not None and len(df) > 50:
+            raw[key] = df
             if label == "H1":
                 h1_full = df
                 df = df.tail(H1_ANALYSIS_BARS).reset_index(drop=True)
@@ -2033,7 +2072,73 @@ async def collect_market(session: aiohttp.ClientSession) -> Dict[str, Any]:
     stack["atr_h4"] = float(analyses["H4"]["atr"])
     price = float(analyses["H1"]["last"])
     book, flow = await asyncio.gather(load_book(session, price), load_flow(session))
-    return {"dfs": dfs, "analyses": analyses, "price": price, "book": book, "flow": flow, "ema_stack": stack}
+    return {"dfs": dfs, "analyses": analyses, "price": price, "book": book, "flow": flow, "ema_stack": stack, "raw": raw}
+
+
+# -------------------- Panel strategi / sniper / liquidity / harian --------------------
+
+def live_grids(raw: Dict[str, pd.DataFrame], df5m: Optional[pd.DataFrame] = None,
+               now: Optional[datetime] = None) -> Dict[str, pd.DataFrame]:
+    """Grid yang sama dengan backtest (strategies.py), hanya candle yang sudah close sebelum `now`."""
+    now_ts = pd.Timestamp(now or _now())
+    grids: Dict[str, pd.DataFrame] = {}
+    if all(k in raw for k in ("1h", "4h", "1d")):
+        end = now_ts.floor("1h")
+        grids["swing"] = STRAT.swing_grid(raw["1h"], raw["4h"], raw["1d"], pd.date_range(end - pd.Timedelta(hours=71), end, freq="1h"))
+    if "15m" in raw and "1h" in raw:
+        end = now_ts.floor("15min")
+        grids["scalp15"] = STRAT.scalp_grid(raw["15m"], "15m", raw["1h"], pd.date_range(end - pd.Timedelta(minutes=15 * 47), end, freq="15min"))
+    if df5m is not None and "1h" in raw:
+        end = now_ts.floor("5min")
+        grids["scalp5"] = STRAT.scalp_grid(df5m, "5m", raw["1h"], pd.date_range(end - pd.Timedelta(minutes=5 * 71), end, freq="5min"))
+    return grids
+
+
+def liquidity_maps(bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
+    price = float(bundle["price"])
+    return [MT.liquidity_map(bundle["dfs"][tf], tf, price) for tf in ("H1", "H4") if tf in bundle["dfs"]]
+
+
+def sniper_plans(bundle: Dict[str, Any], liq: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Optional[Dict[str, Any]]]:
+    liq = liq if liq is not None else liquidity_maps(bundle)
+    return {side: MT.sniper_plan(bundle["analyses"], bundle["dfs"], float(bundle["price"]), side, liq) for side in ("LONG", "SHORT")}
+
+
+def strategy_stats() -> Dict[str, Any]:
+    return MT.load_stats()
+
+
+def format_quick_summary(bundle: Dict[str, Any], decision: Dict[str, Any], news: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Ringkasan pendek untuk /ta: harian, sniper, liquidity, strategi yang aktif, berita."""
+    price = float(bundle["price"])
+    lines = ["━━━━━━━━━━━━━━━━━━━━", "<b>🧭 RINGKASAN CEPAT</b>"]
+    try:
+        raw = bundle.get("raw") or {}
+        if "1d" in raw:
+            d = MT.daily_ema(raw["1d"], price)
+            lines.append(f"📅 Harian: <b>{d['trend']}</b> · EMA7/25/99 D "
+                         + {"ABOVE": "kuning di atas", "BELOW": "kuning di bawah", "MIXED": "campur"}[d["stack"]])
+        liq = liquidity_maps(bundle)
+        above = min((p["price"] for m in liq for p in m["above"]), default=None)
+        below = max((p["price"] for m in liq for p in m["below"]), default=None)
+        sw = sorted([x for m in liq for x in m["sweeps"]], key=lambda x: x["time"], reverse=True)
+        lines.append("💧 Liquidity: atas " + (f"${MT.fp(above)}" if above else "-") + " · bawah " + (f"${MT.fp(below)}" if below else "-")
+                     + (f" · sweep {sw[0]['tf']} {sw[0]['kind']} {MT.fp(sw[0]['level'])}" if sw else ""))
+        plans = sniper_plans(bundle, liq)
+        side = "SHORT" if decision["direction"] == "BEARISH" else ("LONG" if decision["direction"] == "BULLISH" else None)
+        if side and plans.get(side):
+            p = plans[side]
+            lines.append(f"🎯 Sniper {side}: {MT.fp(p['entry_low'])}–{MT.fp(p['entry_high'])} · SL {MT.fp(p['sl'])} · TP1 {MT.fp(p['tp1'])} (1:{p['rr1']:.1f})")
+        else:
+            lines.append("🎯 Sniper: HTF netral, lihat /sniper untuk dua arah")
+        stats = strategy_stats()
+        status = STRAT.live_status(live_grids(bundle.get("raw") or {}))
+        active = [f"{st['strategy'].name.split(' (')[0]} {st['strategy'].side}" for st in status if st.get("ok") and st.get("signal")]
+        lines.append("🧩 Strategi aktif: " + (", ".join(active) if active else "tidak ada") + " (/strategi)")
+    except Exception as exc:  # ringkasan tidak boleh mematikan /ta
+        logger.warning("Ringkasan gagal: %s", exc)
+    lines.append("📰 " + MT.news_summary_line(news))
+    return lines
 
 
 def _plan_from_row(row: sqlite3.Row) -> Dict[str, Any]:
@@ -2129,6 +2234,55 @@ async def _ema_stack_alert(context: ContextTypes.DEFAULT_TYPE, decision: Dict[st
         await broadcast(context.bot, format_ema_stack_alert(stack, decision["price"]))
 
 
+def _cooldown_ok(prev: Optional[sqlite3.Row], hours: float, now: Optional[datetime] = None) -> bool:
+    last = _parse_iso(prev["last_alert_at"]) if prev is not None else None
+    return not last or ((now or _now()) - last) >= timedelta(hours=hours)
+
+
+def strategy_alert_candidates(status: List[Dict[str, Any]], stats: Dict[str, Any]) -> List[Tuple[Dict[str, Any], str]]:
+    """Sinyal yang boleh di-alert: mode 'alert' (OOS positif) atau 'pantauan'. EMA stack punya alert sendiri."""
+    out = []
+    for st in status:
+        if not st.get("ok") or not st.get("signal") or st["strategy"].key == "ema_stack":
+            continue
+        mode = MT.alert_mode(STRAT.stat_key(st["strategy"]), stats, STRAT_WATCH)
+        if mode in ("alert", "pantauan"):
+            out.append((st, mode))
+    return out
+
+
+async def _strategy_alerts(context: ContextTypes.DEFAULT_TYPE, bundle: Dict[str, Any], decision: Dict[str, Any]) -> None:
+    if not STRAT_ALERTS or not bundle.get("raw"):
+        return
+    stats = strategy_stats()
+    status = STRAT.live_status(live_grids(bundle["raw"]))
+    for st, mode in strategy_alert_candidates(status, stats):
+        name = f"strat:{STRAT.stat_key(st['strategy'])}"
+        prev = get_signal_state(name)
+        candle = st["t"].isoformat()
+        if prev is not None and prev["state"] == candle:
+            continue
+        fire = _cooldown_ok(prev, STRAT_COOLDOWN_HOURS)
+        set_signal_state(name, candle, alerted=fire)
+        if fire:
+            logger.info("Alert strategi %s (%s)", name, mode)
+            await broadcast(context.bot, format_strategy_alert(st, mode, stats.get(STRAT.stat_key(st["strategy"]))))
+    # Sniper: hanya arah searah tren yang lolos aturan OOS
+    side = "SHORT" if decision["direction"] == "BEARISH" else ("LONG" if decision["direction"] == "BULLISH" else None)
+    if side and (stats.get(f"sniper:{side}") or {}).get("alert"):
+        plan = sniper_plans(bundle).get(side)
+        if plan:
+            name = f"sniper:{side}"
+            prev = get_signal_state(name)
+            zone = str(int(round(plan["entry_mid"] / max(plan["atr_h1"], 1.0))))  # bucket ≈ 1 ATR H1
+            if (prev is None or prev["state"] != zone) and _cooldown_ok(prev, SNIPER_ALERT_COOLDOWN_HOURS):
+                set_signal_state(name, zone, alerted=True)
+                text = MT.format_sniper({side: plan}, float(bundle["price"]), decision["direction"], stats.get(name))
+                await broadcast(context.bot, "🔔 " + text)
+            elif prev is None or prev["state"] != zone:
+                set_signal_state(name, zone)
+
+
 async def _scan_locked(context: ContextTypes.DEFAULT_TYPE) -> None:
     session: aiohttp.ClientSession = context.application.bot_data["session"]
     try:
@@ -2149,6 +2303,10 @@ async def _scan_locked(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _ema_stack_alert(context, decision)
     except Exception as exc:
         logger.warning("EMA stack alert gagal: %s", exc)
+    try:
+        await _strategy_alerts(context, bundle, decision)
+    except Exception as exc:
+        logger.warning("Alert strategi gagal: %s", exc)
     active = get_active_setup()
     selected = decision["selected"]
 
@@ -2300,6 +2458,12 @@ Alert hanya keluar saat setup berkualitas.
 /ta — laporan lengkap + chart H4
 /h1 /h3 /h4 /daily /weekly /15m — detail satu TF
 /ema — EMA stack 7/25/99 di H1/H3/H4
+/harian — saran EMA harian (Daily)
+/sniper — zona limit sniper + SL/TP
+/liquidity — wick liquidity &amp; pool stop
+/berita — headline + kalender USD high-impact
+/strategi — panel 8 strategi + hasil backtest
+/scalp — scalping momentum 15m/5m
 /sr — support & resistance
 /setup — setup yang sedang dipantau
 /stats — win rate dan 10 hasil terakhir
@@ -2312,11 +2476,34 @@ Alert hanya keluar saat setup berkualitas.
 • TRIGGERED hanya kalau candle H1 + volume konfirmasi
 • FORMING hanya jika zona ≤ 1.2 ATR
 • Cooldown zona 6 jam
+• Alert hanya untuk strategi dengan backtest OOS positif (🔔). LONG bot = info saja. Trend LONG = 👁 pantauan
 • Tidak entry melawan Weekly, tidak kejar RSI H4 ekstrem (≥65 LONG / ≤35 SHORT), TP2 maks 4R
 • EMA stack SHORT (aturan kamu): kuning EMA7 di atas biru EMA25 &amp; pink EMA99 di H1+H3+H4 → alert sekali saat aktif
 
 <i>Bukan saran finansial.</i>
 """
+
+
+async def reply_long(update: Update, text: str, status=None) -> None:
+    parts = MT.split_message(text)
+    for i, part in enumerate(parts):
+        if i == 0 and status is not None:
+            await status.edit_text(part, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        else:
+            await update.message.reply_text(part, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
+async def get_news(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> Optional[Dict[str, Any]]:
+    cache = context.application.bot_data.get("news")
+    if cache and not force and (datetime.now(timezone.utc) - cache["fetched"]) < timedelta(minutes=NEWS_CACHE_MINUTES):
+        return cache
+    try:
+        news = await MT.fetch_news(context.application.bot_data["session"])
+    except Exception as exc:
+        logger.warning("Berita gagal: %s", exc)
+        return cache
+    context.application.bot_data["news"] = news
+    return news
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2344,8 +2531,9 @@ async def cmd_ta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("TA gagal: %s", exc)
         await status.edit_text("❌ Gagal mengambil data market saat ini. Coba lagi sebentar.")
         return
+    bundle["news"] = await get_news(context)
     text = format_report(bundle, decision, get_active_setup())
-    await status.edit_text(text, parse_mode=ParseMode.HTML)
+    await reply_long(update, text, status)
     try:
         plan = decision["selected"] or decision["conservative"] or decision["aggressive"]
         photo = render_chart(bundle["dfs"]["H4"], bundle["analyses"]["H4"], plan)
@@ -2354,6 +2542,73 @@ async def cmd_ta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_photo(photo=payload)
     except Exception as exc:
         logger.warning("Chart /ta gagal: %s", exc)
+
+
+async def _with_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE, wait: str):
+    status = await update.message.reply_text(wait)
+    try:
+        bundle, decision = await _bundle_now(context)
+    except Exception as exc:
+        logger.warning("Market gagal: %s", exc)
+        await status.edit_text("❌ Gagal mengambil data market saat ini. Coba lagi sebentar.")
+        return None, None, None
+    return status, bundle, decision
+
+
+async def cmd_harian(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status, bundle, decision = await _with_bundle(update, context, "⏳ Menghitung EMA harian…")
+    if bundle is None:
+        return
+    text = MT.format_daily(MT.daily_ema(bundle["raw"]["1d"], float(bundle["price"])), strategy_stats().get("ema_stack:SHORT"))
+    await reply_long(update, text, status)
+
+
+async def cmd_sniper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status, bundle, decision = await _with_bundle(update, context, "⏳ Mencari zona sniper…")
+    if bundle is None:
+        return
+    side = "SHORT" if decision["direction"] == "BEARISH" else "LONG"
+    text = MT.format_sniper(sniper_plans(bundle), float(bundle["price"]), decision["direction"], strategy_stats().get(f"sniper:{side}"))
+    await reply_long(update, text, status)
+
+
+async def cmd_liquidity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status, bundle, decision = await _with_bundle(update, context, "⏳ Memetakan likuiditas…")
+    if bundle is None:
+        return
+    await reply_long(update, MT.format_liquidity(liquidity_maps(bundle), float(bundle["price"])), status)
+
+
+async def cmd_berita(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status = await update.message.reply_text("⏳ Mengambil berita dan kalender…")
+    news = await get_news(context)
+    if not news:
+        await status.edit_text("❌ Berita dan kalender gagal diambil. Coba lagi nanti.")
+        return
+    await reply_long(update, MT.format_news(news), status)
+
+
+async def cmd_strategi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status, bundle, decision = await _with_bundle(update, context, "⏳ Mengecek semua strategi…")
+    if bundle is None:
+        return
+    status_rows = STRAT.live_status(live_grids(bundle["raw"]))
+    fams = [f for f in STRAT.FAMILY_ORDER if f not in ("scalp15", "scalp5")]
+    text = MT.format_strategy_panel(status_rows, strategy_stats(), STRAT_WATCH, fams)
+    text += "\n\nScalping: /scalp · Sniper: /sniper · Likuiditas: /liquidity"
+    await reply_long(update, text, status)
+
+
+async def cmd_scalp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status, bundle, decision = await _with_bundle(update, context, "⏳ Mengecek scalping 15m/5m…")
+    if bundle is None:
+        return
+    df5 = await fetch_klines(context.application.bot_data["session"], "5m", 300)
+    rows = STRAT.live_status(live_grids(bundle["raw"], df5))
+    text = MT.format_strategy_panel(rows, strategy_stats(), STRAT_WATCH, ["scalp15", "scalp5"], "⚡ <b>SCALPING MOMENTUM</b>")
+    text += ("\n\n<i>Jujur: dengan fee 0.08% round-trip, fee makan ~0.37R (15m) / ~0.77R (5m) per trade. "
+             "Backtest negatif bahkan dengan fee maker 0.04%. Info saja, tidak ada alert.</i>")
+    await reply_long(update, text, status)
 
 
 async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2518,6 +2773,12 @@ def main() -> None:
     app.add_handler(CommandHandler("ta", cmd_ta))
     app.add_handler(CommandHandler("signal", cmd_signal))
     app.add_handler(CommandHandler("h1", cmd_h1))
+    app.add_handler(CommandHandler("harian", cmd_harian))
+    app.add_handler(CommandHandler("sniper", cmd_sniper))
+    app.add_handler(CommandHandler("liquidity", cmd_liquidity))
+    app.add_handler(CommandHandler("berita", cmd_berita))
+    app.add_handler(CommandHandler("strategi", cmd_strategi))
+    app.add_handler(CommandHandler("scalp", cmd_scalp))
     app.add_handler(CommandHandler("h3", cmd_h3))
     app.add_handler(CommandHandler("ema", cmd_ema))
     app.add_handler(CommandHandler("h4", cmd_h4))
@@ -2557,6 +2818,7 @@ def _selftest() -> None:
     try:
         _selftest_body()
         _selftest_ema_stack()
+        _selftest_tools()
     finally:
         DB_PATH = live_db
     print("selftest ok")
@@ -2629,6 +2891,95 @@ def _selftest_ema_stack() -> None:
     text = "\n".join(format_ema_stack(all_up))
     assert "EMA STACK SHORT AKTIF" in text and "aturan pribadi" in text
     assert "EMA STACK SHORT AKTIF" in format_ema_stack_alert(all_up, 100.0)
+
+
+def _selftest_tools() -> None:
+    # --- liquidity: swing high belum tersentuh di atas harga + sweep low terbaru
+    rows = [(100, 101, 99, 100, 10)] * 30
+    rows[10] = (100, 105, 99.5, 100.5, 10)      # swing high 105 (untapped)
+    rows[20] = (100, 100.5, 96, 99.8, 10)       # swing low 96
+    rows.append((99.8, 100.2, 95.5, 99.9, 30))  # sapu 96 lalu close balik, ekor bawah panjang
+    rows.append((99.9, 100.1, 99.7, 100.0, 5))  # forming
+    liq = MT.liquidity_map(_frame_from_rows(rows), "H1", 100.0, order=3, look_sweep=3)
+    assert any(abs(p["price"] - 105) < 1e-9 for p in liq["above"]), liq["above"]
+    assert any(sw["side"] == "LONG" and abs(sw["level"] - 96) < 1e-9 for sw in liq["sweeps"]), liq["sweeps"]
+    assert all(p["price"] != 96 for p in liq["below"]), "low yang sudah disapu bukan pool lagi"
+    eq = [(100, 101, 99, 100, 10)] * 30
+    eq[8] = (100, 104, 99.5, 100.2, 10)
+    eq[18] = (100, 104.05, 99.5, 100.2, 10)
+    eq.append((100, 100.5, 99.6, 100.1, 5))
+    liq_eq = MT.liquidity_map(_frame_from_rows(eq), "H4", 100.0, order=3)
+    assert liq_eq["above"] and liq_eq["above"][0]["equal"], liq_eq["above"]
+    assert "WICK LIQUIDITY" in MT.format_liquidity([liq, liq_eq], 100.0)
+
+    # --- sniper: confluence S/R + EMA, SL di balik zona, R:R masuk akal
+    analyses = {
+        "H1": {"atr": 1.0, "supports": [97.0], "resistances": [103.0], "ema20": 99.5, "ema50": 97.1, "ema200": 90.0},
+        "H4": {"atr": 2.0, "supports": [96.9], "resistances": [104.0], "ema20": 98.0, "ema50": 101.0, "ema200": 110.0},
+        "Daily": {"supports": [], "resistances": [], "ema20": 120.0, "ema50": 125.0, "ema200": 130.0},
+    }
+    plan = MT.sniper_plan(analyses, {}, 100.0, "LONG", [])
+    assert plan and plan["entry_low"] <= 97.0 <= plan["entry_high"] + 0.2, plan
+    assert plan["sl"] < plan["entry_low"] and plan["tp1"] > plan["entry_high"] and plan["rr1"] >= 1.5, plan
+    assert plan["sl_tight"] > plan["sl"]
+    short = MT.sniper_plan(analyses, {}, 100.0, "SHORT", [])
+    assert short and short["entry_low"] > 100 and short["sl"] > short["entry_high"] and short["tp1"] < short["entry_low"]
+    assert "SNIPER" in MT.format_sniper({"LONG": plan, "SHORT": short}, 100.0, "BULLISH", None)
+
+    # --- EMA harian
+    up = _frame_from_rows([(100 + i, 101 + i, 99 + i, 100.5 + i, 10) for i in range(260)])
+    d = MT.daily_ema(up, 360.0)
+    assert d["stack"] == "ABOVE" and "BULLISH" in d["trend"], d
+    assert "EMA HARIAN" in MT.format_daily(d, None)
+
+    # --- berita: RSS, kalender, tag heuristik, gagal ditangani
+    rss = """<rss><channel><item><title>Bitcoin ETF inflows hit record high</title><link>https://x/a</link>
+    <pubDate>Tue, 10 Nov 2026 02:00:00 +0000</pubDate></item><item><title>Exchange hack drains $50M</title>
+    <link>https://x/b</link><pubDate>Tue, 10 Nov 2026 01:00:00 GMT</pubDate></item></channel></rss>"""
+    items = MT.parse_rss(rss, "T")
+    assert len(items) == 2 and "bullish" in items[0]["tags"] and "bearish" in items[1]["tags"]
+    assert MT.parse_rss("<<not xml", "T") == []
+    now = datetime(2026, 11, 10, 3, tzinfo=timezone.utc)
+    cal = MT.parse_calendar([
+        {"title": "CPI m/m", "country": "USD", "impact": "High", "date": "2026-11-12T08:30:00-05:00"},
+        {"title": "x", "country": "EUR", "impact": "High", "date": "2026-11-12T08:30:00-05:00"},
+        {"title": "y", "country": "USD", "impact": "Low", "date": "2026-11-12T08:30:00-05:00"},
+        {"bad": 1},
+    ], now=now)
+    assert [e["title"] for e in cal] == ["CPI m/m"]
+    news = {"items": items, "sources": ["T"], "calendar": cal, "calendar_ok": True, "fetched": now}
+    txt = MT.format_news(news)
+    assert "CPI m/m" in txt and "heuristik" in txt and "&lt;" not in "".join(i["title"] for i in items)
+    assert "semua sumber gagal" in MT.format_news({"items": [], "sources": [], "calendar": [], "calendar_ok": False, "fetched": now})
+
+    # --- split pesan panjang
+    long_text = "\n".join(f"baris {i} " + "x" * 90 for i in range(200))
+    parts = MT.split_message(long_text)
+    assert len(parts) > 1 and all(len(p) <= 4000 for p in parts) and "\n".join(parts) == long_text
+
+    # --- mode alert: hanya OOS positif, pantauan sesuai daftar, sisanya info
+    stats = {"momentum:SHORT": {"alert": True}, "trend:LONG": {"alert": False}, "range:LONG": {"alert": False}}
+    assert MT.alert_mode("momentum:SHORT", stats, ["trend:LONG"]) == "alert"
+    assert MT.alert_mode("trend:LONG", stats, ["trend:LONG"]) == "pantauan"
+    assert MT.alert_mode("range:LONG", stats, ["trend:LONG"]) == "info"
+    fake = [{"ok": True, "signal": True, "strategy": s, "t": pd.Timestamp("2026-01-01", tz="UTC"), "plan": {}}
+            for s in STRAT.STRATEGIES if STRAT.stat_key(s) in ("momentum:SHORT", "trend:LONG", "range:LONG", "ema_stack:SHORT")]
+    picked = {STRAT.stat_key(st["strategy"]): mode for st, mode in strategy_alert_candidates(fake, stats)}
+    assert picked == {"momentum:SHORT": "alert", "trend:LONG": "pantauan"}, picked
+
+    # --- grid live tidak memakai candle yang belum close
+    base = pd.Timestamp("2026-01-01", tz="UTC")
+    def mk(n, step):
+        return pd.DataFrame({"open_time": [base + i * step for i in range(n)], "open": 100.0, "high": 101.0,
+                             "low": 99.0, "close": 100.0, "volume": 1.0, "taker_buy_base": 0.5})
+    h1 = mk(400, pd.Timedelta(hours=1))
+    h1.loc[h1.index[-1], "close"] = 999.0   # candle forming (belum close)
+    raw = {"1h": h1, "4h": mk(120, pd.Timedelta(hours=4)), "1d": mk(30, pd.Timedelta(days=1)), "15m": mk(400, pd.Timedelta(minutes=15))}
+    now_live = (base + 399 * pd.Timedelta(hours=1) + pd.Timedelta(minutes=30)).to_pydatetime()
+    g = live_grids(raw, now=now_live)["swing"]
+    assert float(g["h1_close"].iloc[-1]) == 100.0, "candle forming bocor ke grid"
+    status = STRAT.live_status({"swing": g})
+    assert len(status) == len([s for s in STRAT.STRATEGIES]) and "PANEL" in MT.format_strategy_panel(status, {}, [])
 
 
 def _selftest_body() -> None:

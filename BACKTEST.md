@@ -116,3 +116,67 @@ Kolom "naik" = avgR untuk trade yang masuk saat Daily bullish.
    Kandidat LONG satu-satunya yang layak dipantau: **EMA20/50 cross H1 searah tren H4**. +0.15R di 1 tahun, positif saat Daily bullish,
    drawdown kecil, tapi cuma 25 trade dan negatif di holdout (5 trade).
 4. Bacaan EMA "normal" (kuning di atas = LONG) kalah dari aturan user di SHORT dan tidak menghasilkan apa-apa di LONG.
+
+---
+
+# Panel 8 strategi + sniper (dipakai di /strategi, /scalp, /sniper)
+
+Definisi ada di `strategies.py`. Bot live dan backtest memakai fungsi yang sama, candle closed saja.
+Periode: holdout 1 Agu–10 Nov 2025, IS 10 Nov 2025–10 Mei 2026, OOS 10 Mei–9 Nov 2026 (1 tahun = IS+OOS).
+Plan swing: SL 1×ATR H4, TP 2R, maks 48 jam. Scalp: SL 1×ATR TF, TP 1.5R, maks 4 jam (15m) / 2 jam (5m), exit dicek di candle 5m.
+Fee 0.08% round-trip; scalp juga dihitung dengan fee maker 0.04%.
+Perintah: `python backtest.py panel` (tulis `strategy_stats.json`), `python backtest.py sniper`, `python backtest.py panel_chart`.
+
+**Aturan alert (otomatis dari `strategy_stats.json`):** avgR OOS > 0 dengan n OOS ≥ 10 **dan** avgR 1 tahun > 0.
+Selain itu info saja, kecuali Trend Following LONG yang diberi label 👁 pantauan (`STRAT_WATCH`).
+
+**LONG** (urut avgR OOS)
+
+| Strategi | n 1y | WR | avgR | PF | maxDD | IS | OOS (n) | holdout (n) | t | fee/trade | status |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Momentum | 143 | 37% | -0.03 | 0.95 | 16.5 | -0.07 | -0.00 (69) | -0.09 (44) | -0.3 | 0.08R | info |
+| Trend Following | 25 | 40% | +0.15 | 1.24 | 3.8 | +0.63 | -0.04 (18) | -0.51 (5) | +0.5 | 0.08R | 👁 pantauan |
+| Benchmark acak | 528 | 35% | -0.10 | 0.86 | 54.5 | -0.07 | -0.12 (268) | -0.12 (150) | – | – | – |
+| Reversal | 27 | 37% | -0.10 | 0.85 | 5.2 | -0.08 | -0.12 (9) | -0.44 (13) | -0.4 | 0.05R | info |
+| Price Action (wick liquidity) | 124 | 40% | -0.03 | 0.96 | 12.4 | +0.09 | -0.15 (61) | -0.05 (34) | -0.2 | 0.07R | info |
+| Breakout | 44 | 34% | -0.22 | 0.68 | 16.8 | -0.26 | -0.17 (21) | -0.06 (19) | -1.2 | 0.07R | info |
+| EMA Stack 7/25/99 (mirror) | 80 | 35% | -0.06 | 0.91 | 9.5 | +0.05 | -0.18 (38) | -0.18 (23) | -0.4 | 0.07R | info |
+| Scalping Momentum 15m (fee maker 0.04%) | 821 | 39% | -0.22 | 0.70 | 180.2 | -0.20 | -0.23 (413) | -0.29 (249) | -5.1 | 0.19R | – |
+| Pullback | 60 | 30% | -0.22 | 0.70 | 19.0 | +0.07 | -0.34 (42) | +0.27 (11) | -1.3 | 0.08R | info |
+| Range | 65 | 29% | -0.38 | 0.48 | 25.7 | -0.27 | -0.44 (41) | -0.35 (30) | -2.8 | 0.08R | info |
+| Scalping Momentum 15m | 821 | 38% | -0.40 | 0.52 | 333.4 | -0.36 | -0.45 (413) | -0.51 (249) | -9.4 | 0.37R | info |
+| Scalping Momentum 5m (fee maker 0.04%) | 2180 | 37% | -0.44 | 0.49 | 966.7 | -0.39 | -0.49 (1113) | -0.49 (646) | -16.6 | 0.39R | – |
+| Scalping Momentum 5m | 2180 | 34% | -0.83 | 0.26 | 1806.5 | -0.71 | -0.94 (1113) | -0.93 (646) | -28.7 | 0.77R | info |
+| Sniper limit searah tren (SL 1×ATR H4) | 37 | 38% | +0.03 | – | – | – | -0.16 (21) | -0.70 (9) | – | – | info |
+
+**SHORT** (urut avgR OOS)
+
+| Strategi | n 1y | WR | avgR | PF | maxDD | IS | OOS (n) | holdout (n) | t | fee/trade | status |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| EMA Stack 7/25/99 (aturan kamu) | 68 | 44% | +0.18 | 1.31 | 13.5 | -0.12 | +0.39 (40) | -0.04 (16) | +1.1 | 0.08R | 🔔 alert |
+| Pullback | 94 | 33% | -0.09 | 0.87 | 21.4 | -0.19 | +0.10 (33) | -0.40 (23) | -0.6 | 0.06R | info |
+| Reversal | 30 | 33% | -0.10 | 0.85 | 6.1 | -0.23 | +0.10 (12) | +0.29 (8) | -0.4 | 0.07R | info |
+| Breakout | 55 | 35% | -0.08 | 0.88 | 12.0 | -0.22 | +0.09 (25) | -0.10 (16) | -0.4 | 0.06R | info |
+| Momentum | 155 | 39% | +0.03 | 1.05 | 14.7 | -0.00 | +0.06 (78) | +0.05 (45) | +0.3 | 0.07R | 🔔 alert |
+| Trend Following | 44 | 34% | -0.03 | 0.95 | 6.7 | -0.05 | -0.00 (16) | -0.09 (10) | -0.2 | 0.06R | info |
+| Price Action (wick liquidity) | 119 | 34% | -0.09 | 0.87 | 18.9 | -0.19 | -0.01 (66) | -0.09 (32) | -0.7 | 0.07R | info |
+| Benchmark acak | 515 | 36% | -0.04 | 0.94 | 47.8 | -0.05 | -0.04 (270) | -0.03 (155) | – | – | – |
+| Range | 64 | 30% | -0.23 | 0.69 | 16.6 | -0.39 | -0.10 (35) | +0.04 (26) | -1.4 | 0.08R | info |
+| Scalping Momentum 15m (fee maker 0.04%) | 887 | 39% | -0.19 | 0.74 | 180.9 | -0.15 | -0.22 (452) | -0.21 (266) | -4.5 | 0.17R | – |
+| Scalping Momentum 15m | 887 | 39% | -0.36 | 0.56 | 327.6 | -0.30 | -0.41 (452) | -0.40 (266) | -8.6 | 0.34R | info |
+| Scalping Momentum 5m (fee maker 0.04%) | 2387 | 39% | -0.39 | 0.54 | 931.8 | -0.33 | -0.44 (1254) | -0.45 (728) | -14.9 | 0.37R | – |
+| Scalping Momentum 5m | 2387 | 36% | -0.76 | 0.31 | 1811.7 | -0.64 | -0.87 (1254) | -0.85 (728) | -26.1 | 0.74R | info |
+| Sniper limit searah tren (SL 1×ATR H4) | 62 | 39% | -0.01 | – | – | – | -0.10 (26) | +0.15 (20) | – | – | info |
+### Kesimpulan jujur
+
+- **Yang lolos aturan alert cuma 2:** EMA Stack SHORT (aturan kamu, +0.18R, OOS +0.39R) dan Momentum SHORT
+  (+0.03R, OOS +0.06R, holdout +0.05R). Momentum SHORT edge-nya sangat tipis (t=0.3), hampir sama dengan benchmark acak (-0.04R).
+- **Tidak ada strategi LONG yang lolos.** Trend Following LONG +0.15R di 1 tahun tapi OOS -0.04R dan holdout -0.51R → 👁 pantauan saja.
+  Catatan: periode ini bear market (BTC -29%), jadi hasil LONG wajar jelek. Ulangi saat tren berubah.
+- **Scalping mati karena fee:** fee makan 0.34–0.37R (15m) dan 0.74–0.77R (5m) per trade. Dengan fee maker 0.04% pun tetap -0.2 s/d -0.4R.
+  Sebelum fee 15m hampir impas (≈ -0.03R). Tidak ada alert scalping.
+- **Sniper:** SL ketat (0.5 ATR H1) kalah telak (WR 13–18%). SL 1×ATR H4 ≈ impas (SHORT -0.01R, LONG +0.03R),
+  OOS negatif di dua arah → info saja. Satu revisi SL dicoba (0.5/1.0 ATR H4); lebih dari itu sudah overfitting.
+- **Setup bot:** SHORT tetap alert. LONG diturunkan ke info saja (`BOT_LONG_ALERTS=0`).
+- Rule terlihat rapuh: setelah perbaikan kecil di peta likuiditas, OOS sniper SHORT berubah +0.04R → -0.10R.
+  Angka di bawah ±0.1R per trade praktis noise.

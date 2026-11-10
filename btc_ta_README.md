@@ -64,3 +64,19 @@ Tes: `python btc_ta_bot.py --selftest` (pakai DB sementara) · `python btc_ta_bo
 Lihat `BACKTEST.md` (hasil, penyebab loss, dan alasan tiap filter). Ringkas: `python fetch_history.py`, lalu
 `python backtest.py decisions current` dan `python backtest.py report`.
 Filter baru bisa diatur lewat env: `RSI_LONG_MAX_H4`, `RSI_SHORT_MIN_H4`, `BLOCK_AGAINST_WEEKLY`, `TP2_MAX_R`.
+
+## Perintah baru
+
+| Command | Fungsi |
+|---|---|
+| `/harian` | Saran EMA harian: EMA7/25/99 + 20/50/200 Daily, tren, support/resistance dinamis |
+| `/sniper` | Zona limit di confluence S/R + EMA + likuiditas, SL 1×ATR H4 (dan SL ketat), TP + R:R |
+| `/liquidity` | Pool likuiditas di atas/bawah (termasuk equal highs/lows) dan sweep wick terbaru |
+| `/berita` | Headline 24 jam (CoinDesk, Cointelegraph, The Block, Decrypt) + kalender USD high-impact (ForexFactory) |
+| `/strategi` | Panel 8 strategi: status live + WR/avgR backtest. 🔔 alert / 👁 pantauan / ℹ️ info |
+| `/scalp` | Scalping momentum 15m & 5m (info saja, fee membuatnya negatif) |
+
+`/ta` sekarang punya "Ringkasan cepat" dari semua fitur di atas. Pesan > 4000 karakter dipecah otomatis.
+Env: `BOT_LONG_ALERTS` (0), `STRAT_WATCH` (trend:LONG), `STRAT_ALERTS` (1), `STRAT_COOLDOWN_HOURS` (6),
+`SNIPER_SL_ATR_H4` (1.0), `SNIPER_ALERT_COOLDOWN_HOURS` (12), `NEWS_CACHE_MINUTES` (10).
+Status alert tiap strategi dibaca dari `strategy_stats.json`; jalankan ulang `python backtest.py panel` dan `python backtest.py sniper` untuk memperbaruinya.

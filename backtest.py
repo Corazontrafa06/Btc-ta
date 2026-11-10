@@ -678,6 +678,269 @@ def lab_chart(names: List[str], out: str) -> None:
     fig.savefig(out)
 
 
+# ================================================================== panel strategi (strategies.py)
+import json as _json  # noqa: E402
+
+import strategies as S  # noqa: E402
+
+PANEL_PERIODS = {
+    "holdout": ("2025-08-01", "2025-11-10"),
+    "is": ("2025-11-10", "2026-05-10"),
+    "oos": ("2026-05-10", "2026-11-10"),
+    "y1": ("2025-11-10", "2026-11-10"),
+}
+STATS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_stats.json")
+
+
+def panel_grids() -> Dict[str, pd.DataFrame]:
+    data = _load()
+    m5 = pd.read_pickle(os.path.join(DATA, "5m.pkl"))
+    a, b = pd.Timestamp("2025-08-01", tz="UTC"), pd.Timestamp("2026-11-09 23:00", tz="UTC")
+    return {
+        "swing": S.swing_grid(data["1h"], data["4h"], data["1d"], pd.date_range(a, b, freq="1h")),
+        "scalp15": S.scalp_grid(data["15m"], "15m", data["1h"], pd.date_range(a, b, freq="15min")),
+        "scalp5": S.scalp_grid(m5, "5m", data["1h"], pd.date_range(a, b, freq="5min")),
+    }
+
+
+def strat_trades(g: pd.DataFrame, s: "S.Strategy", exit_df: pd.DataFrame, bar_minutes: int, fee_rt: float) -> pd.DataFrame:
+    ot = exit_df.open_time.values
+    hold = int(s.hold_h * 60 / bar_minutes)
+    rows, busy = [], None
+    sub = g[s.mask(g).fillna(False).astype(bool)]
+    for r in sub.itertuples(index=False):
+        t = r.t
+        if busy is not None and t < busy:
+            continue
+        row = r._asdict()
+        plan = S.plan_for(s, row)
+        if plan is None:
+            continue
+        i0 = int(np.searchsorted(ot, t.to_datetime64()))
+        if i0 >= len(ot):
+            break
+        rr, _, out, ei = _exit_walk(exit_df, i0, s.side, plan["entry"], plan["sl"], plan["tp"], plan["tp"], hold)
+        busy = pd.Timestamp(ot[ei]).tz_localize("UTC") + pd.Timedelta(minutes=bar_minutes)
+        risk = abs(plan["entry"] - plan["sl"])
+        rows.append({"entry_t": t, "exit_t": busy, "side": s.side, "r": rr - fee_rt * plan["entry"] / risk,
+                     "r_gross": rr, "outcome": out, "d_up": bool(row.get("d_up", False)), "risk_pct": plan["risk_pct"]})
+    return pd.DataFrame(rows)
+
+
+def _period(tr: pd.DataFrame, name: str) -> pd.DataFrame:
+    a, b = PANEL_PERIODS[name]
+    if len(tr) == 0:
+        return tr
+    return tr[(tr.entry_t >= pd.Timestamp(a, tz="UTC")) & (tr.entry_t < pd.Timestamp(b, tz="UTC"))]
+
+
+def panel_report() -> None:
+    import math as _math
+    grids = panel_grids()
+    m15 = pd.read_pickle(os.path.join(DATA, "15m.pkl"))
+    m5 = pd.read_pickle(os.path.join(DATA, "5m.pkl"))
+    rows, curves, stats = [], {}, {}
+    bench = {}
+    for side in ("LONG", "SHORT"):  # benchmark acak: plan swing standar tiap jam
+        s = S.Strategy("bench", "Benchmark acak", side, "swing", lambda g: pd.Series(True, index=g.index), "acak")
+        bench[side] = strat_trades(grids["swing"], s, m15, 15, FEE_RT)
+    runs = [(s, FEE_RT, "") for s in S.STRATEGIES] + [(s, 0.0004, " (fee maker 0.04%)") for s in S.STRATEGIES if s.grid != "swing"]
+    for s, fee, tag in runs:
+        exit_df, bm = (m15, 15) if s.grid == "swing" else (m5, 5)
+        tr = strat_trades(grids[s.grid], s, exit_df, bm, fee)
+        m = {p: metrics(_period(tr, p)) for p in PANEL_PERIODS}
+        y = _period(tr, "y1")
+        tstat = float(y.r.mean() / (y.r.std() / _math.sqrt(len(y)))) if len(y) > 2 and y.r.std() > 0 else float("nan")
+        up = metrics(y[y.d_up]) if len(y) else metrics(y)
+        name = f"{s.name}{tag}"
+        rows.append({"name": name, "side": s.side, "n": m["y1"]["n"], "wr": m["y1"]["wr"], "avg_r": m["y1"]["avg_r"],
+                     "pf": m["y1"]["pf"], "maxdd": m["y1"]["maxdd"], "tot_r": m["y1"]["tot_r"],
+                     "is_r": m["is"]["avg_r"], "oos_n": m["oos"]["n"], "oos_r": m["oos"]["avg_r"],
+                     "hold_n": m["holdout"]["n"], "hold_r": m["holdout"]["avg_r"], "up_r": up["avg_r"], "t": tstat,
+                     "fee_r": float((y.r_gross - y.r).mean()) if len(y) else float("nan")})
+        curves[f"{name} {s.side}"] = y
+        if not tag:
+            alert = bool(m["oos"]["avg_r"] > 0 and m["oos"]["n"] >= 10 and m["y1"]["avg_r"] > 0)
+            stats[S.stat_key(s)] = {
+                "name": s.name, "side": s.side, "n": m["y1"]["n"], "wr": round(m["y1"]["wr"], 1),
+                "avg_r": round(m["y1"]["avg_r"], 3), "pf": round(m["y1"]["pf"], 2) if np.isfinite(m["y1"]["pf"]) else None,
+                "oos_n": m["oos"]["n"], "oos_avg_r": round(m["oos"]["avg_r"], 3),
+                "holdout_n": m["holdout"]["n"], "holdout_avg_r": round(m["holdout"]["avg_r"], 3),
+                "t": round(tstat, 2) if np.isfinite(tstat) else None, "alert": alert,
+            }
+    for side, tr in bench.items():
+        m = {p: metrics(_period(tr, p)) for p in PANEL_PERIODS}
+        rows.append({"name": "Benchmark acak", "side": side, "n": m["y1"]["n"], "wr": m["y1"]["wr"], "avg_r": m["y1"]["avg_r"],
+                     "pf": m["y1"]["pf"], "maxdd": m["y1"]["maxdd"], "tot_r": m["y1"]["tot_r"], "is_r": m["is"]["avg_r"],
+                     "oos_n": m["oos"]["n"], "oos_r": m["oos"]["avg_r"], "hold_n": m["holdout"]["n"],
+                     "hold_r": m["holdout"]["avg_r"], "up_r": float("nan"), "t": float("nan"), "fee_r": float("nan")})
+        curves[f"Benchmark acak {side}"] = _period(tr, "y1")
+    stats["_meta"] = {"generated": pd.Timestamp.now(tz="UTC").isoformat(timespec="minutes"), "fee_rt": FEE_RT,
+                      "periods": PANEL_PERIODS, "rule": "alert hanya jika avgR OOS > 0 (n OOS ≥ 10) dan avgR 1 tahun > 0",
+                      "plan_swing": "SL 1×ATR H4, TP 2R, maks 48 jam", "plan_scalp": "SL 1×ATR TF, TP 1.5R, maks 4j (15m) / 2j (5m)"}
+    with open(STATS_PATH, "w") as fh:
+        _json.dump(stats, fh, indent=1, ensure_ascii=False)
+    df = pd.DataFrame(rows)
+    df.to_pickle(os.path.join(DATA, "panel_results.pkl"))
+    with open(os.path.join(DATA, "panel_curves.pkl"), "wb") as fh:
+        pickle.dump(curves, fh)
+    pd.set_option("display.width", 260)
+    for side in ("LONG", "SHORT"):
+        print(f"\n=== {side} (urut avgR OOS) ===")
+        print(df[df.side == side].sort_values("oos_r", ascending=False).round(2).to_string(index=False))
+    print("\nstats →", STATS_PATH)
+
+
+# ------------------------------------------------------------------ sniper backtest
+import market_tools as MT  # noqa: E402
+
+
+def _sniper_at(t: pd.Timestamp) -> Dict[str, Any]:
+    bundle = bundle_at(t)
+    a, dfs, px = bundle["analyses"], bundle["dfs"], bundle["price"]
+    liq = [MT.liquidity_map(dfs["H1"], "H1", px), MT.liquidity_map(dfs["H4"], "H4", px)]
+    return {"t": t, "price": px, "direction": B.htf_direction(a),
+            "LONG": MT.sniper_plan(a, dfs, px, "LONG", liq), "SHORT": MT.sniper_plan(a, dfs, px, "SHORT", liq)}
+
+
+def _resl(p: Optional[Dict[str, Any]], sl_atr_h4: float) -> Optional[Dict[str, Any]]:
+    """Variasi SL struktural: buffer k×ATR H4 di balik zona; TP1/TP2 dihitung ulang 2R/3R kalau terlalu dekat."""
+    if p is None or sl_atr_h4 <= 0:
+        return p
+    q = dict(p)
+    long = q["side"] == "LONG"
+    q["sl"] = q["entry_low"] - sl_atr_h4 * q["atr_h4"] if long else q["entry_high"] + sl_atr_h4 * q["atr_h4"]
+    risk = abs(q["entry_mid"] - q["sl"])
+    s = 1 if long else -1
+    if s * (q["tp1"] - q["entry_mid"]) < 1.5 * risk:
+        q["tp1"] = q["entry_mid"] + s * 2 * risk
+    q["tp2"] = q["entry_mid"] + s * 3 * risk
+    q["risk_pct"] = risk / q["entry_mid"] * 100
+    return q
+
+
+def sniper_backtest(valid_h: int = 12, fee_rt: float = FEE_RT, sl_atr_h4: float = 0.0) -> Dict[str, pd.DataFrame]:
+    cache = os.path.join(DATA, "sniper_plans.pkl")
+    if os.path.exists(cache):
+        with open(cache, "rb") as fh:
+            plans = pickle.load(fh)
+    else:
+        data = _load()
+        times = list(pd.date_range("2025-08-01", "2026-11-09", freq="4h", tz="UTC"))
+        with Pool(os.cpu_count() or 2, initializer=_init, initargs=(data,)) as pool:
+            plans = pool.map(_sniper_at, times, chunksize=16)
+        with open(cache, "wb") as fh:
+            pickle.dump(plans, fh)
+    m15 = pd.read_pickle(os.path.join(DATA, "15m.pkl"))
+    ot, hi, lo = m15.open_time.values, m15.high.values, m15.low.values
+    out = {}
+    for mode in ("with", "against"):
+        for side in ("LONG", "SHORT"):
+            rows, busy = [], None
+            for pl in plans:
+                p = _resl(pl[side], sl_atr_h4)
+                wt = (side == "LONG" and pl["direction"] == "BULLISH") or (side == "SHORT" and pl["direction"] == "BEARISH")
+                if p is None or (mode == "with") != wt or (busy is not None and pl["t"] < busy):
+                    continue
+                i0 = int(np.searchsorted(ot, pl["t"].to_datetime64()))
+                i1 = min(len(ot), i0 + valid_h * 4)
+                fill_i = None
+                for i in range(i0, i1):
+                    if (side == "LONG" and hi[i] >= p["tp1"]) or (side == "SHORT" and lo[i] <= p["tp1"]):
+                        break  # lari ke TP1 dulu → batal
+                    if (side == "LONG" and lo[i] <= p["entry_mid"]) or (side == "SHORT" and hi[i] >= p["entry_mid"]):
+                        fill_i = i
+                        break
+                if fill_i is None:
+                    continue
+                r, _, outc, ei = _exit_walk(m15, fill_i, side, p["entry_mid"], p["sl"], p["tp1"], p["tp2"], 192)
+                risk = abs(p["entry_mid"] - p["sl"])
+                busy = pd.Timestamp(ot[ei]).tz_localize("UTC") + pd.Timedelta(minutes=15)
+                rows.append({"entry_t": pd.Timestamp(ot[fill_i]).tz_localize("UTC"), "exit_t": busy, "side": side,
+                             "r": r - fee_rt * p["entry_mid"] / risk, "outcome": outc, "risk_pct": p["risk_pct"]})
+            out[f"{mode}:{side}"] = pd.DataFrame(rows)
+    return out
+
+
+def sniper_report() -> None:
+    # SNIPER_VARIANTS=1 + cache dari plan SL ketat (SNIPER_SL_ATR_H4=0) → tabel variasi SL.
+    for k in ((0.0, 0.5, 1.0) if os.getenv("SNIPER_VARIANTS") == "1" else ()):
+        for key, tr in sniper_backtest(sl_atr_h4=k).items():
+            m = {p: metrics(_period(tr, p)) for p in PANEL_PERIODS}
+            print(f"  variasi SL {'0.5×ATR H1' if k == 0 else f'{k:g}×ATR H4':10s} {key:13s} 1y n={m['y1']['n']:3d} "
+                  f"WR={m['y1']['wr']:4.0f}% avgR={m['y1']['avg_r']:+.2f} | IS {m['is']['avg_r']:+.2f} OOS {m['oos']['avg_r']:+.2f} holdout {m['holdout']['avg_r']:+.2f}")
+    sl_k = 0.0  # plan sudah dibuat dengan SL yang sama seperti bot live (env SNIPER_SL_ATR_H4)
+    res = sniper_backtest(sl_atr_h4=sl_k)
+    res_maker = sniper_backtest(fee_rt=0.0004, sl_atr_h4=sl_k)
+    stats = load_stats_file()
+    for k, tr in res.items():
+        m = {p: metrics(_period(tr, p)) for p in PANEL_PERIODS}
+        mk = metrics(_period(res_maker[k], "y1"))
+        print(f"sniper {k:13s} 1y {fmt_m(m['y1'])} | IS {m['is']['avg_r']:+.2f} OOS {m['oos']['avg_r']:+.2f} (n{m['oos']['n']}) "
+              f"holdout {m['holdout']['avg_r']:+.2f} (n{m['holdout']['n']}) | maker-fee avgR {mk['avg_r']:+.2f}")
+        if k.startswith("with"):
+            stats[f"sniper:{k.split(':')[1]}"] = {"name": "Sniper limit (searah tren)", "side": k.split(":")[1],
+                                                  "n": m["y1"]["n"], "wr": round(m["y1"]["wr"], 1), "avg_r": round(m["y1"]["avg_r"], 3),
+                                                  "oos_n": m["oos"]["n"], "oos_avg_r": round(m["oos"]["avg_r"], 3),
+                                                  "holdout_n": m["holdout"]["n"], "holdout_avg_r": round(m["holdout"]["avg_r"], 3),
+                                                  "alert": bool(m["oos"]["avg_r"] > 0 and m["oos"]["n"] >= 10 and m["y1"]["avg_r"] > 0)}
+    with open(STATS_PATH, "w") as fh:
+        _json.dump(stats, fh, indent=1, ensure_ascii=False)
+    with open(os.path.join(DATA, "sniper_curves.pkl"), "wb") as fh:
+        pickle.dump({k: _period(v, "y1") for k, v in res.items()}, fh)
+
+
+def load_stats_file() -> Dict[str, Any]:
+    try:
+        with open(STATS_PATH) as fh:
+            return _json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def panel_chart(out: str = "/workspace/artifacts/strategies_compare.png") -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    with open(os.path.join(DATA, "panel_curves.pkl"), "rb") as fh:
+        curves = pickle.load(fh)
+    with open(os.path.join(DATA, "sniper_curves.pkl"), "rb") as fh:
+        sn = pickle.load(fh)
+    pick = [("EMA Stack 7/25/99 (aturan kamu) SHORT", "-"), ("Momentum SHORT", "-"), ("Trend Following LONG", "-"),
+            ("Pullback SHORT", "-"), ("Price Action (wick liquidity) LONG", "-"), ("Scalping Momentum 15m SHORT", ":"),
+            ("Benchmark acak SHORT", "--"), ("Benchmark acak LONG", "--")]
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6), dpi=110, gridspec_kw={"width_ratios": [2.2, 1]})
+    ax = axes[0]
+    for name, ls in pick:
+        tr = curves.get(name)
+        if tr is None or len(tr) == 0:
+            continue
+        tr = tr.sort_values("exit_t")
+        ax.step(tr.exit_t, tr.r.cumsum(), where="post", linestyle=ls, label=f"{name}: {len(tr)} trade, {tr.r.sum():+.1f}R")
+    for k, tr in sn.items():
+        if k.startswith("with") and len(tr):
+            tr = tr.sort_values("exit_t")
+            ax.step(tr.exit_t, tr.r.cumsum(), where="post", linestyle="-.", label=f"Sniper searah tren {k[5:]}: {len(tr)} trade, {tr.r.sum():+.1f}R")
+    ax.axvline(pd.Timestamp(PANEL_PERIODS["oos"][0], tz="UTC"), color="grey", linestyle="--", linewidth=1)
+    ax.axhline(0, color="black", linewidth=0.6)
+    ax.set_ylim(-60, 30)
+    ax.set_title("Equity 1 tahun (R setelah fee 0.08%) — scalping 15m dipotong (total di legend)")
+    ax.legend(loc="lower left", fontsize=7)
+    ax.grid(alpha=0.3)
+    df = pd.read_pickle(os.path.join(DATA, "panel_results.pkl"))
+    df = df[~df.name.str.contains("maker")].copy()
+    df["label"] = df.name.str.replace(r" \(.*\)", "", regex=True).str.replace("Scalping Momentum", "Scalp") + " " + df.side
+    df = df.sort_values("oos_r")
+    ax2 = axes[1]
+    colors = ["#2e7d32" if (o > 0 and y > 0) else "#c62828" for o, y in zip(df.oos_r, df.avg_r)]
+    ax2.barh(df.label, df.oos_r.clip(lower=-1), color=colors)
+    ax2.axvline(0, color="black", linewidth=0.6)
+    ax2.set_title("avgR OOS per strategi (hijau = OOS & 1 tahun > 0)")
+    ax2.tick_params(axis="y", labelsize=7)
+    fig.tight_layout()
+    fig.savefig(out)
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
     tag = sys.argv[2] if len(sys.argv) > 2 else "current"
@@ -690,3 +953,9 @@ if __name__ == "__main__":
         report()
     elif cmd == "strategies":
         strategies_report()
+    elif cmd == "panel":
+        panel_report()
+    elif cmd == "sniper":
+        sniper_report()
+    elif cmd == "panel_chart":
+        panel_chart()
