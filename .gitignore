@@ -1,0 +1,8 @@
+.venv/
+.env
+.env.local
+*.db
+bot.log
+bot.pid
+__pycache__/
+bot.log.prev

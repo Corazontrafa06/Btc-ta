@@ -16,7 +16,13 @@ Gerbang alert
 State: FORMING → TRIGGERED → TP1 → TP2 / BE, atau SL / INVALID / EXPIRED.
 /stats membaca hasil yang tersimpan. Cooldown ada di database, bukan memory.
 
-Env: BOT_TOKEN, DB_PATH (opsional)
+EMA Stack (aturan pribadi user, warna default Bybit)
+- EMA kuning = EMA_FAST (7), biru = EMA_MID (25), pink = EMA_SLOW (99).
+- Kuning di atas biru DAN pink di H1, H3, H4 (candle closed) = sinyal SHORT versi user.
+  Ini kebalikan pembacaan tren biasa; dipakai sebagai catatan/gerbang + alert, bukan skor.
+- H3 dibangun dari resample candle 1h (Binance tidak punya interval 3h), batas UTC 00/03/06/...
+
+Env: BOT_TOKEN, DB_PATH, EMA_FAST, EMA_MID, EMA_SLOW, EMA_STACK_COOLDOWN_HOURS (opsional)
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.patches import Rectangle
-from telegram import Update
+from telegram import LinkPreviewOptions, Update
 from telegram.constants import ParseMode
 from telegram.error import Forbidden
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -75,13 +81,22 @@ FAPI_OI_HIST = [
 
 TIMEFRAMES = {
     "15m": {"interval": "15m", "limit": 300, "label": "15m"},
-    "1h": {"interval": "1h", "limit": 320, "label": "H1"},
+    "1h": {"interval": "1h", "limit": 1000, "label": "H1"},  # 1000 supaya H3 (resample) cukup panjang
     "4h": {"interval": "4h", "limit": 320, "label": "H4"},
     "1d": {"interval": "1d", "limit": 400, "label": "Daily"},
     "1w": {"interval": "1w", "limit": 300, "label": "Weekly"},
 }
-TF_WEIGHT = {"Weekly": 3, "Daily": 3, "H4": 2, "H1": 1, "15m": 0}
-TF_ORDER = ["Weekly", "Daily", "H4", "H1", "15m"]
+H1_ANALYSIS_BARS = 320          # analisis H1 tetap pakai 320 candle seperti sebelumnya
+TF_WEIGHT = {"Weekly": 3, "Daily": 3, "H4": 2, "H3": 0, "H1": 1, "15m": 0}
+TF_ORDER = ["Weekly", "Daily", "H4", "H3", "H1", "15m"]
+
+# EMA stack: warna mengikuti default Bybit (7 kuning / 25 biru / 99 pink)
+EMA_FAST = int(os.getenv("EMA_FAST", "7"))
+EMA_MID = int(os.getenv("EMA_MID", "25"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "99"))
+EMA_STACK_TFS = ("H1", "H3", "H4")
+EMA_STACK_COOLDOWN_HOURS = float(os.getenv("EMA_STACK_COOLDOWN_HOURS", "4"))
+EMA_COLORS = {"fast": "#F5C542", "mid": "#4C8BF5", "slow": "#D65DB1"}
 
 MIN_RR_INTRADAY = 1.6
 MIN_RR_SWING = 1.8
@@ -111,6 +126,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("BTC_TA")
+# httpx INFO mencetak URL lengkap (berisi BOT_TOKEN) ke log; cukup WARNING.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 _db_lock = asyncio.Lock()
 
@@ -163,6 +180,16 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_state (
+                name          TEXT PRIMARY KEY,
+                state         TEXT,
+                changed_at    TEXT,
+                last_alert_at TEXT
+            )
+            """
+        )
         conn.commit()
 
 
@@ -180,6 +207,26 @@ def remove_subscriber(chat_id: int) -> None:
         conn.execute(
             "UPDATE subscribers SET subscribed = 0 WHERE chat_id = ?",
             (chat_id,),
+        )
+        conn.commit()
+
+
+def get_signal_state(name: str) -> Optional[sqlite3.Row]:
+    with closing(_connect()) as conn:
+        return conn.execute("SELECT * FROM signal_state WHERE name = ?", (name,)).fetchone()
+
+
+def set_signal_state(name: str, state: str, alerted: bool = False) -> None:
+    prev = get_signal_state(name)
+    now = _iso()
+    changed = now if prev is None or prev["state"] != state else prev["changed_at"]
+    last_alert = now if alerted else (prev["last_alert_at"] if prev is not None else None)
+    with closing(_connect()) as conn:
+        conn.execute(
+            "INSERT INTO signal_state (name, state, changed_at, last_alert_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET state = excluded.state, changed_at = excluded.changed_at, "
+            "last_alert_at = excluded.last_alert_at",
+            (name, state, changed, last_alert),
         )
         conn.commit()
 
@@ -371,10 +418,68 @@ async def fetch_klines(
     return _klines_to_df(raw)
 
 
+def resample_h3(df_1h: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Bangun candle 3h dari 1h, batas UTC 00/03/06/... Grup pertama yang tidak lengkap dibuang;
+    grup terakhir boleh belum lengkap (sama seperti candle forming di TF lain)."""
+    if df_1h is None or len(df_1h) < 30:
+        return None
+    frame = df_1h.copy()
+    frame["bucket"] = frame["open_time"].dt.floor("3h")
+    grouped = frame.groupby("bucket", sort=True)
+    out = grouped.agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+        taker_buy_base=("taker_buy_base", "sum"),
+        count=("close", "size"),
+    ).reset_index().rename(columns={"bucket": "open_time"})
+    if len(out) and out["count"].iloc[0] < 3:
+        out = out.iloc[1:]
+    out = out.drop(columns=["count"]).reset_index(drop=True)
+    return out if len(out) >= 50 else None
+
+
 # -------------------- Indicators --------------------
 
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
+
+
+def ema_stack_tf(df: pd.DataFrame) -> Dict[str, Any]:
+    """Posisi EMA kuning (fast) terhadap biru (mid) dan pink (slow) di candle terakhir yang CLOSED."""
+    closed = df.iloc[:-1] if len(df) > 1 else df
+    close = closed["close"]
+    fast = float(ema(close, EMA_FAST).iloc[-1])
+    mid = float(ema(close, EMA_MID).iloc[-1])
+    slow = float(ema(close, EMA_SLOW).iloc[-1])
+    if fast > mid and fast > slow:
+        state = "ABOVE"     # kuning di atas 2 warna → SHORT versi user
+    elif fast < mid and fast < slow:
+        state = "BELOW"     # kuning di bawah 2 warna → mirror (LONG), info saja
+    else:
+        state = "MIXED"
+    return {"fast": fast, "mid": mid, "slow": slow, "state": state, "enough": len(close) >= EMA_SLOW + 20}
+
+
+def ema_stack(dfs: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    per_tf: Dict[str, Dict[str, Any]] = {}
+    for label in EMA_STACK_TFS:
+        if label in dfs and len(dfs[label]) > EMA_SLOW:
+            per_tf[label] = ema_stack_tf(dfs[label])
+    complete = all(label in per_tf for label in EMA_STACK_TFS)
+    states = [per_tf[label]["state"] for label in EMA_STACK_TFS if label in per_tf]
+    short_on = complete and all(state == "ABOVE" for state in states)
+    long_on = complete and all(state == "BELOW" for state in states)
+    return {
+        "per_tf": per_tf,
+        "complete": complete,
+        "short": short_on,
+        "long": long_on,
+        "above_count": sum(1 for state in states if state == "ABOVE"),
+        "below_count": sum(1 for state in states if state == "BELOW"),
+    }
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -1165,6 +1270,17 @@ def build_decision(bundle: Dict[str, Any]) -> Dict[str, Any]:
     elif direction != "NEUTRAL":
         passes.append("Weekly searah")
 
+    stack = bundle.get("ema_stack") or ema_stack(dfs)
+    if stack["short"]:
+        if direction == "BEARISH":
+            passes.append(f"EMA stack SHORT (aturan kamu: EMA{EMA_FAST} di atas EMA{EMA_MID} & EMA{EMA_SLOW} di H1/H3/H4) searah SHORT")
+        elif direction == "BULLISH":
+            passes.append(f"EMA stack SHORT aktif melawan HTF bullish — aggressive LONG dimatikan")
+        else:
+            passes.append("EMA stack SHORT aktif, HTF netral — hanya peringatan, belum ada setup")
+    elif stack["complete"] and direction == "BEARISH":
+        passes.append(f"EMA stack SHORT belum lengkap ({stack['above_count']}/3 TF), tidak memblokir")
+
     cons_idea = None
     cons_reason = "menunggu HTF sepakat"
     agg_idea = None
@@ -1266,6 +1382,8 @@ def build_decision(bundle: Dict[str, Any]) -> Dict[str, Any]:
 
         # Aggressive hanya kalau momentum sangat kuat + tidak ada zona pullback dekat
         agg_blocks = _aggressive_blocks(side, analyses, dfs, flow)
+        if side == "LONG" and stack["short"]:
+            agg_blocks.append(f"EMA stack SHORT aktif (EMA{EMA_FAST} di atas {EMA_MID}/{EMA_SLOW} di H1/H3/H4)")
         h1_bias = int(h1.get("bias_score", 0))
         strong_momentum = (side == "LONG" and h1_bias >= 1) or (side == "SHORT" and h1_bias <= -1)
         if strong_momentum and not agg_blocks:
@@ -1321,6 +1439,8 @@ def build_decision(bundle: Dict[str, Any]) -> Dict[str, Any]:
                         vol_ok = True
 
         # Phase decision
+        if cons_idea["side"] == "SHORT" and stack["short"]:
+            cons_idea["note"] = f"{cons_idea['note']}; EMA stack SHORT mendukung"
         if tagged and ok and vol_ok and dist_atr <= TRIGGER_MAX_ATR:
             cons_idea["phase"] = "TRIGGERED"
             cons_idea["note"] = f"{cons_idea['note']}; konfirmasi {how}"
@@ -1381,6 +1501,7 @@ def build_decision(bundle: Dict[str, Any]) -> Dict[str, Any]:
         "selected": selected,
         "sweep": sweep,
         "atr": atr_val,
+        "ema_stack": stack,
     }
 
 
@@ -1538,7 +1659,10 @@ def format_report(bundle: Dict[str, Any], decision: Dict[str, Any], active: Opti
             continue
         row = analyses[label]
         weight = TF_WEIGHT[label]
-        extra = "  · timing saja" if weight == 0 else f"  · bobot {weight}"
+        if label == "H3":
+            extra = "  · EMA stack saja"
+        else:
+            extra = "  · timing saja" if weight == 0 else f"  · bobot {weight}"
         lines.append(
             f"{bias_emoji(row['bias'])} <b>{label}</b>: {row['bias']}  |  RSI {row['rsi']:.0f} ({row['rsi_status']}){extra}"
         )
@@ -1547,6 +1671,8 @@ def format_report(bundle: Dict[str, Any], decision: Dict[str, Any], active: Opti
         f"🎯 <b>Overall:</b> <b>{decision['direction']}</b> "
         f"(skor {decision['score']:+d}/{decision['score_max']})"
     )
+    lines.append("")
+    lines.extend(format_ema_stack(decision.get("ema_stack")))
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("<b>📌 KEY LEVELS (H4 + Daily)</b>")
@@ -1617,6 +1743,45 @@ def format_report(bundle: Dict[str, Any], decision: Dict[str, Any], active: Opti
     if len(text) > 4000:
         text = text[:3900] + "\n\n… (terpotong)"
     return text
+
+
+def format_ema_stack(stack: Optional[Dict[str, Any]]) -> List[str]:
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"<b>🟡 EMA STACK {EMA_FAST}/{EMA_MID}/{EMA_SLOW}</b> (aturan kamu, candle closed)",
+    ]
+    if not stack or not stack.get("per_tf"):
+        lines.append("Data EMA stack tidak tersedia.")
+        return lines
+    marks = {"ABOVE": "🔴 kuning DI ATAS biru & pink", "BELOW": "🟢 kuning DI BAWAH biru & pink", "MIXED": "⚪ campur"}
+    for label in EMA_STACK_TFS:
+        row = stack["per_tf"].get(label)
+        if not row:
+            lines.append(f"{label}: data kurang")
+            continue
+        lines.append(
+            f"{label}: {marks[row['state']]}  ({fmt_price(row['fast'])} / {fmt_price(row['mid'])} / {fmt_price(row['slow'])})"
+        )
+    if stack["short"]:
+        lines.append(f"➡️ <b>EMA STACK SHORT AKTIF</b> (3/3 TF)")
+    elif stack["long"]:
+        lines.append("➡️ Mirror: kuning di bawah semua di 3/3 TF (versi LONG, info saja)")
+    else:
+        lines.append(f"➡️ Belum aktif: kuning di atas {stack['above_count']}/3 TF, di bawah {stack['below_count']}/3 TF")
+    lines.append("<i>Catatan: ini aturan pribadi kamu, kebalikan pembacaan tren biasa (biasanya kuning di atas = bullish).</i>")
+    return lines
+
+
+def format_ema_stack_alert(stack: Dict[str, Any], price: float) -> str:
+    lines = [
+        "🟡🔴 <b>EMA STACK SHORT AKTIF</b>",
+        f"Harga: <b>${fmt_price(price)}</b>",
+        f"EMA{EMA_FAST} (kuning) di atas EMA{EMA_MID} (biru) dan EMA{EMA_SLOW} (pink) di H1, H3, H4.",
+        "",
+    ]
+    lines.extend(format_ema_stack(stack)[2:])
+    lines += ["", "Ini bukan entry otomatis. Cek /ta untuk zona, SL, dan gerbang lain.", "<i>⚠️ Bukan saran finansial.</i>"]
+    return "\n".join(lines)
 
 
 def format_alert(state: str, plan: Dict[str, Any], extra: str = "") -> str:
@@ -1721,6 +1886,9 @@ def render_chart(df: pd.DataFrame, analysis: Dict[str, Any], plan: Optional[Dict
     e20 = ema(full_close, 20).tail(n).to_numpy()
     e50 = ema(full_close, 50).tail(n).to_numpy()
     e200 = ema(full_close, 200 if len(full_close) >= 220 else max(20, len(full_close) // 2)).tail(n).to_numpy()
+    e_fast = ema(full_close, EMA_FAST).tail(n).to_numpy()
+    e_mid = ema(full_close, EMA_MID).tail(n).to_numpy()
+    e_slow = ema(full_close, EMA_SLOW).tail(n).to_numpy()
 
     fig, (ax, axv) = plt.subplots(
         2, 1, figsize=(12.6, 7.3), dpi=120, sharex=True,
@@ -1742,9 +1910,14 @@ def render_chart(df: pd.DataFrame, analysis: Dict[str, Any], plan: Optional[Dict
         body_h = max(abs(row.close - row.open), (row.high - row.low) * 0.004, 1)
         ax.add_patch(Rectangle((i - width / 2, body_low), width, body_h, facecolor=color, edgecolor=color, linewidth=0))
         axv.bar(i, row.volume, width=width, color=color, alpha=0.85)
-    ax.plot(range(n), e20, color="#e8c36a", linewidth=1.2, label="EMA20")
-    ax.plot(range(n), e50, color="#7aa2f7", linewidth=1.1, label="EMA50")
-    ax.plot(range(n), e200, color="#d38bb5", linewidth=1.1, label="EMA200")
+    # Warna seperti Bybit: kuning = cepat, biru = tengah, pink = lambat
+    ax.plot(range(n), e_fast, color=EMA_COLORS["fast"], linewidth=1.3, label=f"EMA{EMA_FAST}")
+    ax.plot(range(n), e_mid, color=EMA_COLORS["mid"], linewidth=1.2, label=f"EMA{EMA_MID}")
+    ax.plot(range(n), e_slow, color=EMA_COLORS["slow"], linewidth=1.2, label=f"EMA{EMA_SLOW}")
+    # EMA20/50/200 (dipakai skor bias) tetap ada tapi samar
+    ax.plot(range(n), e20, color="#8d93a1", linewidth=0.7, linestyle="--", alpha=0.55, label="EMA20")
+    ax.plot(range(n), e50, color="#8d93a1", linewidth=0.7, linestyle="-.", alpha=0.55, label="EMA50")
+    ax.plot(range(n), e200, color="#8d93a1", linewidth=0.8, linestyle=":", alpha=0.7, label="EMA200")
     for level in (analysis.get("resistances") or [])[:3]:
         ax.axhline(level, color="#8d93a1", linewidth=0.6, linestyle=":", alpha=0.7)
     for level in (analysis.get("supports") or [])[:3]:
@@ -1759,7 +1932,7 @@ def render_chart(df: pd.DataFrame, analysis: Dict[str, Any], plan: Optional[Dict
         f"BTCUSDT H4   ${fmt_price(analysis['last'])}   {analysis['bias']}",
         color="#f2efe9", loc="left", fontsize=13, pad=10,
     )
-    legend = ax.legend(loc="upper left", frameon=False, ncol=3, fontsize=8)
+    legend = ax.legend(loc="upper left", frameon=False, ncol=5, fontsize=8, columnspacing=1.2, handlelength=1.6)
     for text in legend.get_texts():
         text.set_color("#d9d6d0")
     axv.set_ylabel("Vol", color="#b7b3ac")
@@ -1783,16 +1956,29 @@ async def collect_market(session: aiohttp.ClientSession) -> Dict[str, Any]:
     frames = await asyncio.gather(*tasks)
     dfs: Dict[str, pd.DataFrame] = {}
     analyses: Dict[str, Dict[str, Any]] = {}
+    h1_full: Optional[pd.DataFrame] = None
     for key, df in zip(TIMEFRAMES.keys(), frames):
         label = TIMEFRAMES[key]["label"]
         if df is not None and len(df) > 50:
+            if label == "H1":
+                h1_full = df
+                df = df.tail(H1_ANALYSIS_BARS).reset_index(drop=True)
             dfs[label] = df
             analyses[label] = analyze_tf(df, label)
     if "H4" not in analyses or "H1" not in analyses:
         raise RuntimeError("data H4/H1 tidak lengkap")
+    h3 = resample_h3(h1_full)
+    if h3 is not None:
+        dfs["H3"] = h3
+        analyses["H3"] = analyze_tf(h3, "H3")
+    # EMA stack H1 memakai riwayat 1h penuh supaya EMA lebih stabil
+    stack_dfs = dict(dfs)
+    if h1_full is not None:
+        stack_dfs["H1"] = h1_full
+    stack = ema_stack(stack_dfs)
     price = float(analyses["H1"]["last"])
     book, flow = await asyncio.gather(load_book(session, price), load_flow(session))
-    return {"dfs": dfs, "analyses": analyses, "price": price, "book": book, "flow": flow}
+    return {"dfs": dfs, "analyses": analyses, "price": price, "book": book, "flow": flow, "ema_stack": stack}
 
 
 def _plan_from_row(row: sqlite3.Row) -> Dict[str, Any]:
@@ -1837,9 +2023,9 @@ async def broadcast(bot, text: str, photo: Optional[bytes] = None) -> None:
                 caption = text if len(text) <= 1000 else text[:980] + "…"
                 await bot.send_photo(chat_id=chat_id, photo=payload, caption=caption, parse_mode=ParseMode.HTML)
                 if len(text) > 1000:
-                    await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                    await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
             else:
-                await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
             await asyncio.sleep(0.05)
         except Forbidden:
             logger.info("Chat %s memblokir bot, unsubscribe", chat_id)
@@ -1863,6 +2049,31 @@ async def _push(context: ContextTypes.DEFAULT_TYPE, bundle: Dict[str, Any], stat
     await broadcast(context.bot, format_alert(state, plan, extra), photo)
 
 
+def ema_stack_should_alert(stack: Dict[str, Any], prev: Optional[sqlite3.Row], now: Optional[datetime] = None) -> bool:
+    """Alert hanya saat transisi ke ON, dan tidak lebih sering dari cooldown."""
+    if not stack.get("short"):
+        return False
+    if prev is not None and prev["state"] == "ON":
+        return False
+    last = _parse_iso(prev["last_alert_at"]) if prev is not None else None
+    now = now or _now()
+    if last and now - last < timedelta(hours=EMA_STACK_COOLDOWN_HOURS):
+        return False
+    return True
+
+
+async def _ema_stack_alert(context: ContextTypes.DEFAULT_TYPE, decision: Dict[str, Any]) -> None:
+    stack = decision.get("ema_stack")
+    if not stack or not stack.get("complete"):
+        return
+    prev = get_signal_state("ema_stack_short")
+    fire = ema_stack_should_alert(stack, prev)
+    set_signal_state("ema_stack_short", "ON" if stack["short"] else "OFF", alerted=fire)
+    if fire:
+        logger.info("EMA stack SHORT baru aktif, broadcast")
+        await broadcast(context.bot, format_ema_stack_alert(stack, decision["price"]))
+
+
 async def _scan_locked(context: ContextTypes.DEFAULT_TYPE) -> None:
     session: aiohttp.ClientSession = context.application.bot_data["session"]
     try:
@@ -1879,6 +2090,10 @@ async def _scan_locked(context: ContextTypes.DEFAULT_TYPE) -> None:
         decision["selected"]["style"] if decision["selected"] else "-",
         "; ".join(decision["blocks"]) or "-",
     )
+    try:
+        await _ema_stack_alert(context, decision)
+    except Exception as exc:
+        logger.warning("EMA stack alert gagal: %s", exc)
     active = get_active_setup()
     selected = decision["selected"]
 
@@ -2023,12 +2238,13 @@ async def _monitor_locked(context: ContextTypes.DEFAULT_TYPE) -> None:
 WELCOME = """
 🟠 <b>BTC Technical Analysis Bot</b>
 
-Analisis <b>BTCUSDT</b> multi-timeframe fokusus <b>H1 + H4</b>.
+Analisis <b>BTCUSDT</b> multi-timeframe fokus <b>H1 + H4</b>.
 Alert hanya keluar saat setup berkualitas.
 
 <b>Perintah</b>
 /ta — laporan lengkap + chart H4
-/h1 /h4 /daily /weekly /15m — detail satu TF
+/h1 /h3 /h4 /daily /weekly /15m — detail satu TF
+/ema — EMA stack 7/25/99 di H1/H3/H4
 /sr — support & resistance
 /setup — setup yang sedang dipantau
 /stats — win rate dan 10 hasil terakhir
@@ -2041,6 +2257,7 @@ Alert hanya keluar saat setup berkualitas.
 • TRIGGERED hanya kalau candle H1 + volume konfirmasi
 • FORMING hanya jika zona ≤ 1.2 ATR
 • Cooldown zona 6 jam
+• EMA stack SHORT (aturan kamu): kuning EMA7 di atas biru EMA25 &amp; pink EMA99 di H1+H3+H4 → alert sekali saat aktif
 
 <i>Bukan saran finansial.</i>
 """
@@ -2103,6 +2320,28 @@ async def cmd_tf(update: Update, context: ContextTypes.DEFAULT_TYPE, tf_key: str
 
 async def cmd_h1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await cmd_tf(update, context, "1h")
+
+
+async def cmd_h3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status = await update.message.reply_text("⏳ Mengambil data H3 (resample 1h)…")
+    session: aiohttp.ClientSession = context.application.bot_data["session"]
+    h3 = resample_h3(await fetch_klines(session, "1h", 1000))
+    if h3 is None:
+        await status.edit_text("Gagal mengambil data H3.")
+        return
+    await status.edit_text(format_tf(analyze_tf(h3, "H3")), parse_mode=ParseMode.HTML)
+
+
+async def cmd_ema(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status = await update.message.reply_text("⏳ Mengecek EMA stack H1/H3/H4…")
+    try:
+        bundle, decision = await _bundle_now(context)
+    except Exception as exc:
+        logger.warning("EMA gagal: %s", exc)
+        await status.edit_text("❌ Gagal mengambil data market saat ini.")
+        return
+    text = "\n".join([f"Harga: <b>${fmt_price(decision['price'])}</b>"] + format_ema_stack(decision.get("ema_stack")))
+    await status.edit_text(text, parse_mode=ParseMode.HTML)
 
 
 async def cmd_h4(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2190,6 +2429,8 @@ async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def post_init(app: Application) -> None:
     app.bot_data["session"] = aiohttp.ClientSession()
+    me = await app.bot.get_me()
+    logger.info("getMe ok: @%s (%s)", me.username, me.first_name)
     if app.job_queue is None:
         logger.error("Job queue tidak tersedia. Install python-telegram-bot[job-queue].")
         return
@@ -2221,6 +2462,8 @@ def main() -> None:
     app.add_handler(CommandHandler("ta", cmd_ta))
     app.add_handler(CommandHandler("signal", cmd_signal))
     app.add_handler(CommandHandler("h1", cmd_h1))
+    app.add_handler(CommandHandler("h3", cmd_h3))
+    app.add_handler(CommandHandler("ema", cmd_ema))
     app.add_handler(CommandHandler("h4", cmd_h4))
     app.add_handler(CommandHandler("daily", cmd_daily))
     app.add_handler(CommandHandler("weekly", cmd_weekly))
@@ -2249,7 +2492,92 @@ def _frame_from_rows(rows: List[Tuple[float, float, float, float, float]]) -> pd
 
 
 def _selftest() -> None:
+    # Jangan pernah sentuh database live: selftest selalu pakai file sementara.
+    global DB_PATH
+    import tempfile
+    live_db = DB_PATH
+    tmpdir = tempfile.mkdtemp(prefix="btc_ta_selftest_")
+    DB_PATH = os.path.join(tmpdir, "selftest.db")
+    try:
+        _selftest_body()
+        _selftest_ema_stack()
+    finally:
+        DB_PATH = live_db
+    print("selftest ok")
+
+
+def _trend_frame(start: float, step: float, bars: int, start_ms: int = 1_700_006_400_000, hours: int = 1) -> pd.DataFrame:
+    data = []
+    price = start
+    for i in range(bars):
+        nxt = price + step
+        data.append({
+            "open_time": pd.to_datetime(start_ms + i * hours * 3_600_000, unit="ms", utc=True),
+            "open": price, "high": max(price, nxt) * 1.001, "low": min(price, nxt) * 0.999,
+            "close": nxt, "volume": 100.0, "taker_buy_base": 50.0,
+        })
+        price = nxt
+    return pd.DataFrame(data)
+
+
+def _selftest_ema_stack() -> None:
+    # Resample H3: batas 00/03/06 UTC, OHLCV benar, grup awal parsial dibuang.
+    h1 = _trend_frame(100, 1, 400, start_ms=int(pd.Timestamp("2024-01-01 01:00", tz="UTC").value // 1_000_000))
+    h3 = resample_h3(h1)
+    assert h3 is not None
+    assert all(ts.hour % 3 == 0 and ts.minute == 0 for ts in h3["open_time"]), "H3 tidak align UTC"
+    assert h3["open_time"].iloc[0] == pd.Timestamp("2024-01-01 03:00", tz="UTC"), h3["open_time"].iloc[0]
+    first = h1[(h1["open_time"] >= h3["open_time"].iloc[0]) & (h1["open_time"] < h3["open_time"].iloc[0] + pd.Timedelta(hours=3))]
+    assert h3["open"].iloc[0] == first["open"].iloc[0]
+    assert h3["close"].iloc[0] == first["close"].iloc[-1]
+    assert h3["high"].iloc[0] == first["high"].max() and h3["low"].iloc[0] == first["low"].min()
+    assert h3["volume"].iloc[0] == first["volume"].sum()
+
+    # Naik terus → EMA7 di atas 25 & 99 = ABOVE (SHORT versi user). Turun → BELOW.
+    up = _trend_frame(100, 1, 300)
+    down = _trend_frame(400, -1, 300)
+    assert ema_stack_tf(up)["state"] == "ABOVE"
+    assert ema_stack_tf(down)["state"] == "BELOW"
+    # Naik lama lalu turun tajam → kuning di bawah 25 tapi masih di atas 99 = MIXED
+    mixed = pd.concat([_trend_frame(100, 1, 250), _trend_frame(350, -2.5, 12, start_ms=1_700_006_400_000 + 250 * 3_600_000)], ignore_index=True)
+    assert ema_stack_tf(mixed)["state"] == "MIXED", ema_stack_tf(mixed)
+
+    all_up = ema_stack({"H1": up, "H3": up, "H4": up})
+    assert all_up["short"] and not all_up["long"] and all_up["above_count"] == 3
+    two_up = ema_stack({"H1": up, "H3": up, "H4": down})
+    assert not two_up["short"] and two_up["above_count"] == 2
+    missing = ema_stack({"H1": up, "H4": up})
+    assert not missing["short"] and not missing["complete"]
+    all_down = ema_stack({"H1": down, "H3": down, "H4": down})
+    assert all_down["long"] and not all_down["short"]
+
+    # Forming candle diabaikan: lonjakan di candle terakhir tidak mengubah state.
+    spike = up.copy()
+    spike.loc[spike.index[-1], "close"] = 1.0
+    assert ema_stack_tf(spike)["state"] == "ABOVE"
+
+    # Dedupe alert
+    init_db()
+    assert ema_stack_should_alert(all_up, None)
+    set_signal_state("ema_stack_short", "ON", alerted=True)
+    prev = get_signal_state("ema_stack_short")
+    assert not ema_stack_should_alert(all_up, prev), "tidak boleh spam saat masih ON"
+    set_signal_state("ema_stack_short", "OFF")
+    prev = get_signal_state("ema_stack_short")
+    assert prev["last_alert_at"] is not None
+    assert not ema_stack_should_alert(all_up, prev), "cooldown harus menahan flip cepat"
+    later = _now() + timedelta(hours=EMA_STACK_COOLDOWN_HOURS + 0.1)
+    assert ema_stack_should_alert(all_up, prev, now=later)
+    assert not ema_stack_should_alert(two_up, None)
+
+    text = "\n".join(format_ema_stack(all_up))
+    assert "EMA STACK SHORT AKTIF" in text and "aturan pribadi" in text
+    assert "EMA STACK SHORT AKTIF" in format_ema_stack_alert(all_up, 100.0)
+
+
+def _selftest_body() -> None:
     assert TF_WEIGHT["15m"] == 0
+    assert TF_WEIGHT["H3"] == 0
     analyses = {
         "Weekly": {"bias_score": 0},
         "Daily": {"bias_score": 0},
@@ -2369,7 +2697,6 @@ def _selftest() -> None:
     assert get_active_setup() is None
     assert recent_fingerprint("TEST-LONG")
     assert "Menang: 1" in format_stats()
-    print("selftest ok")
 
 
 async def _once() -> None:
@@ -2381,13 +2708,17 @@ async def _once() -> None:
     print(text)
     plan = decision["selected"] or decision["conservative"] or decision["aggressive"]
     png = render_chart(bundle["dfs"]["H4"], bundle["analyses"]["H4"], plan)
-    out = "/workspace/artifacts/btc_h4.png"
+    out = os.getenv("CHART_OUT", "/workspace/artifacts/btc_h4.png")
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "wb") as handle:
         handle.write(png)
     print(f"\nchart {out} {len(png)} bytes")
     print("selected", decision["selected"]["style"] if decision["selected"] else None, decision["selected"]["phase"] if decision["selected"] else "")
     print("cons", bool(decision["conservative"]), decision["conservative_reason"])
     print("agg", bool(decision["aggressive"]), decision["aggressive_reason"])
+    stack = decision["ema_stack"]
+    print("ema_stack short", stack["short"], "long", stack["long"],
+          {k: v["state"] for k, v in stack["per_tf"].items()})
 
 
 if __name__ == "__main__":
