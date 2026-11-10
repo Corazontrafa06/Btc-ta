@@ -62,3 +62,57 @@ jadi sebagian besar perbedaan adalah noise. Yang dipakai hanya kombinasi terbaik
 - Tapi t-stat ≈ 0.9 → belum signifikan, dan periodenya bear market. TP 1.5R hasilnya ≈ 0.
 - Rata-rata harga 48 jam setelah aktif justru naik (+0.37 ATR): banyak koreksi kecil, sesekali lanjut naik kencang. SL wajib.
 - Di bot: tetap tampil di /ta, /ema, dan dikirim sekali saat baru aktif dengan rencana SL/TP yang diuji.
+
+---
+
+# Strategy lab 1 tahun (LONG & SHORT)
+
+`python backtest.py strategies`, dengan window 10 Nov 2025 → 9 Nov 2026. IS < 10 Mei 2026 ≤ OOS, 3 fold walk-forward 4 bulanan,
+plus holdout tambahan 1 Agu → 9 Nov 2025 yang tidak dipakai memilih apa pun.
+Indikator per TF dihitung dari candle closed dan dipetakan ke grid jam memakai waktu close candle, jadi tidak ada lookahead
+(flag EMA stack 99.9% sama dengan replay bot). Entry di close H1, SL k×ATR H4, TP n·R, maks 48 jam, satu posisi per strategi.
+Exit dicek di 15m, fee 0.08%.
+
+**Konteks:** BTC 104.7k → 74.9k (-29%). Daily bullish (close > EMA50 D) cuma 38% dari jam. Semua strategi LONG dinilai dengan caveat ini.
+Kolom "naik" = avgR untuk trade yang masuk saat Daily bullish.
+
+### SHORT (urut avgR 1 tahun)
+
+| Strategi | n 1y | WR | avgR | PF | maxDD | total R | IS avgR | OOS avgR | fold 1/2/3 | holdout Agu–Nov 25 | t |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| EMA stack user (kuning di atas → SHORT) SL1 TP3* | 65 | 42% | +0.37 | 1.59 | 12.5 | +24.0 | -0.01 | +0.64 | +1.26/-0.24/+0.63 | -0.11 (n14) | 1.7 |
+| **EMA stack user SL1 TP2 (rencana asli)** | 68 | 44% | +0.18 | 1.31 | 13.5 | +12.4 | -0.12 | +0.39 | +0.92/-0.26/+0.33 | -0.04 (n16) | 1.1 |
+| Bot sekarang (zona bot, SHORT) | 23 | – | +0.27 | – | – | +6.1 | +0.38 | +0.12 | – | – | – |
+| EMA stack "normal" (kuning di bawah → SHORT) | 94 | 39% | +0.03 | 1.06 | 14.1 | +3.1 | -0.08 | +0.15 | – | +0.23 (n23) | 0.2 |
+| Sweep reversal tanpa filter | 201 | 36% | -0.03 | 0.95 | 20.5 | -6.5 | -0.05 | -0.01 | – | +0.01 | -0.3 |
+| Benchmark acak SHORT | 516 | 36% | -0.04 | 0.93 | 47.8 | -22.5 | -0.05 | -0.04 | – | -0.02 | -0.7 |
+| Trend pullback EMA H4+D | 94 | 33% | -0.09 | 0.87 | 21.4 | -8.5 | -0.19 | +0.10 | – | -0.40 | -0.6 |
+| RSI pullback / BB mean-rev / sweep+H4 / breakout-retest | 42–89 | 30–42% | -0.15…-0.02 | <1 | – | negatif | – | – | – | – | – |
+
+### LONG (urut avgR 1 tahun)
+
+| Strategi | n 1y | WR | avgR | PF | maxDD | total R | IS avgR | OOS avgR | naik (Daily bull) | holdout Agu–Nov 25 | t |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| EMA cross H1 20/50 + filter H4 naik | 25 | 40% | +0.15 | 1.24 | 3.8 | +3.7 | +0.63 (n7) | -0.04 | +0.10 (n21) | -0.51 (n5) | 0.5 |
+| EMA stack mirror (kuning di bawah → LONG) SL0.75 TP3* | 82 | 33% | +0.11 | 1.16 | 9.6 | +9.3 | +0.19 | +0.02 | -0.18 | -0.06 (n23) | 0.6 |
+| Sweep reversal tanpa filter | 213 | 38% | -0.04 | 0.94 | 18.5 | -8.9 | +0.05 | -0.12 | -0.13 | -0.10 | -0.5 |
+| **EMA stack mirror SL1 TP2 (rencana asli)** | 80 | 35% | -0.06 | 0.91 | 9.5 | -4.6 | +0.05 | -0.18 | -0.31 | -0.18 | -0.4 |
+| Benchmark acak LONG | 528 | 35% | -0.09 | 0.86 | 54.4 | -49.4 | -0.07 | -0.12 | -0.17 | -0.12 | -1.6 |
+| EMA stack "normal" (kuning di atas → LONG) | 74 | 36% | -0.10 | 0.85 | 14.0 | -7.6 | +0.11 | -0.29 | +0.05 | +0.01 | -0.7 |
+| RSI pullback in trend | 62 | 35% | -0.17 | 0.76 | 13.6 | -10.2 | +0.12 | -0.33 | -0.15 | -0.25 | -1.0 |
+| Bot sekarang (zona bot, LONG) | 10 | – | -0.55 | – | – | -5.5 | -1.14 (n2) | -0.41 | – | – | – |
+| Trend pullback EMA, sweep+H4, breakout-retest, BB mean-rev | 31–65 | 24–28% | -0.34…-0.44 OOS | <0.6 | – | negatif | – | – | – | – | – |
+
+\* = variasi SL/TP terbaik dari 9 yang dicoba (dipilih setelah lihat hasil → optimis). Tidak ada strategi dengan t > 2.
+
+### Kesimpulan
+
+1. **EMA stack SHORT versi user (SL 1×ATR H4, TP 2R, 48 jam)** adalah yang terbaik dan paling dekat dengan strategi kita:
+   +0.18R/trade setelah fee selama 1 tahun (68 trade, +12.4R). Benchmark SHORT acak = -0.04R. Positif di 2 dari 3 fold.
+   Juga positif saat Daily bullish (+0.24R, n=37), jadi bukan cuma ikut bear market. **Tapi** t=1.1, IS (Nov–Mei) negatif,
+   dan di holdout Agu–Nov 2025 ≈ 0. Edge mungkin ada tapi kecil dan belum terbukti. TP 3R terlihat lebih bagus, tapi itu hasil pilih-pilih.
+2. **Setup SHORT bot (kode sekarang)**: +0.27R/trade, 23 trade, positif di IS dan OOS. Sampel kecil.
+3. **LONG:** tidak ada yang robust. Mirror aturan user untuk LONG (SL1 TP2) negatif (-0.06R), dan saat Daily bullish malah lebih buruk (-0.31R).
+   Kandidat LONG satu-satunya yang layak dipantau: **EMA20/50 cross H1 searah tren H4**. +0.15R di 1 tahun, positif saat Daily bullish,
+   drawdown kecil, tapi cuma 25 trade dan negatif di holdout (5 trade).
+4. Bacaan EMA "normal" (kuning di atas = LONG) kalah dari aturan user di SHORT dan tidak menghasilkan apa-apa di LONG.
